@@ -47,3 +47,38 @@ Outage numbers come from a `FaultInjector` in front of real providers (an inject
 Per-tenant budgets, guardrails, MCP tools, RAG, A2A and the ADK orchestration arrive in later phases.
 
 Prices in `factory.py` are the published Gemini API paid-tier prices read on 2026-10-03; they are configuration and will change.
+
+---
+
+## Phase 2: the support-ticket platform (`tickets/`, `guardrails/`)
+
+```
+ticket -> input guard -> triage -> resolver (MCP tools) -> responder -> output guard -> released | held | escalated
+```
+
+| Piece | Built with |
+|---|---|
+| Three agents (triage, resolver, responder) | Requisite `Agent`, provider = `TenantProvider(gateway, tenant)` |
+| Orchestration, switchable | Requisite `Workflow` on **Google ADK** (`use_adk()`) or the native engine (`use_native()`) |
+| Tools | Requisite `MCPServer` (3 read-only tools, stdio) consumed by Requisite `MCPClient` |
+| Guardrails | `guardrails/`: PII redaction (Luhn-checked cards), injection screening, output validation; fail-closed policy |
+| Tracing | OpenTelemetry: ADK spans, Requisite `agent`/`ai` spans (GenAI attributes from Requisite 0.39.0) and the gateway span nest in one trace |
+| Per-tenant budgets, sticky tool loops, degraded-tier hold | `gateway/provider.py`, `tickets/platform.py` |
+
+```bash
+venv/Scripts/python -m pytest tests_offline -q                        # 46 offline tests
+venv/Scripts/python -u run_ticket_eval.py --pin-light --show          # both backends, same model, 9 labelled tickets
+```
+
+### What the real runs showed (Gemini free tier, `gemini-3.5-flash-lite`, 9 synthetic tickets)
+
+- **Both orchestrators reach the same results.** ADK and native: category 7/7, severity 4/7 (the same three severity calls differ from my labels on both), expected facts present 93% (ADK) and 100% (native) on 7 tickets. With n=7 that difference is noise, not a finding. Median latency was dominated by per-call MCP process start-up, not by the orchestrator.
+- **Guardrails:** both injection tickets were escalated with **zero model or tool calls**; the PII ticket reached the model with the email, phone and card replaced by `[EMAIL]`, `[PHONE]`, `[CARD]` and was still resolved correctly.
+- **Output guard needs an allowlist.** A reply quoting the company's own `no-reply@` address was held as "PII" until the guard learned the company domain.
+- **Silent failover hides a quota problem.** In the tiered run the heavy model (`gemini-3.5-flash`) returned `429` (free-tier limit: 20 requests per day) and the gateway quietly served those calls from the light model. Availability held; the only trace was the audit log.
+- **Failover keeps the system up, not the answers good.** A second backend run built its own rate limiter, together exceeded the real quota, tripped both Gemini breakers, and 22 of 28 calls were answered by the local 1B model: category accuracy fell to 4/7 and expected facts to 36%, yet **the guardrails released all seven replies** (they check for leaks, not correctness). The platform now holds any ticket served by the degraded tier. Share one `RateLimiter` per API key.
+- **Mid-tool-loop failover breaks tool calling.** One request failed with `400: Function call is missing a thought_signature` after a route change inside a tool loop; the gateway now pins a tool loop to the route that started it (verified offline with scripted fakes; the live failure was seen once).
+- **MCP over stdio reconnects on every tool call**, and `initialize` dominated each call (about 5.9 s of 6.4 s in one trace, 2.0 s of 2.3 s in another).
+- **ADK's per-agent token counters read empty** (`in=None out=None`) because Requisite's ADK shim does not pass usage back to ADK.
+
+Cost figures are computed from published paid-tier prices; the runs themselves used the free tier.

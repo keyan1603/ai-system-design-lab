@@ -18,7 +18,7 @@ import asyncio
 import hashlib
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -26,7 +26,14 @@ from requisite.core.cost_limiter import CostLimiter
 from requisite.core.exceptions import CostLimitException, ProviderException
 from requisite.core.interfaces import ChatResponse, Message, Role, StreamChunk
 from requisite.providers.base import BaseProvider
-from requisite.telemetry.otel import get_tracer
+from requisite.telemetry.otel import (
+    GEN_AI_OPERATION_NAME,
+    GEN_AI_RESPONSE_MODEL,
+    GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_OUTPUT_TOKENS,
+    genai_request_attributes,
+    get_tracer,
+)
 
 from gateway.audit import AuditLog, AuditRecord
 from gateway.cache import SemanticCache, make_scope, prompt_text
@@ -50,6 +57,7 @@ class GatewayProvider(BaseProvider):
         classifier: Classifier = default_classifier,
         cache: Optional[SemanticCache] = None,
         cost_limiter: Optional[CostLimiter] = None,
+        tenant_budgets: Optional[Callable[[str], CostLimiter]] = None,
         audit: Optional[AuditLog] = None,
         default_tenant: str = "default",
     ) -> None:
@@ -60,6 +68,14 @@ class GatewayProvider(BaseProvider):
         self.classifier = classifier
         self.cache = cache
         self.cost_limiter = cost_limiter
+        # One CostLimiter per tenant, created on first use, so one tenant's
+        # spend can never block another's. The global limiter (if any) is the
+        # fleet-wide ceiling above them.
+        self._tenant_budget_factory = tenant_budgets
+        self._tenant_budgets: dict[str, CostLimiter] = {}
+        # Which route served the tool-calling turns of each conversation, so the
+        # rest of that tool loop can be pinned to it (see _plan).
+        self._loop_routes: "dict[str, Route]" = {}
         self.audit = audit or AuditLog()
         self.default_tenant = default_tenant
 
@@ -75,6 +91,23 @@ class GatewayProvider(BaseProvider):
     def validate_config(self) -> None:
         for r in self.routes:
             r.provider.validate_config()
+
+    def tenant_budget(self, tenant: str) -> Optional[CostLimiter]:
+        if self._tenant_budget_factory is None:
+            return None
+        if tenant not in self._tenant_budgets:
+            self._tenant_budgets[tenant] = self._tenant_budget_factory(tenant)
+        return self._tenant_budgets[tenant]
+
+    def _check_budgets(self, tenant: str) -> None:
+        for limiter in (self.cost_limiter, self.tenant_budget(tenant)):
+            if limiter is not None:
+                limiter.check()
+
+    def _record_spend(self, tenant: str, response: ChatResponse) -> None:
+        for limiter in (self.cost_limiter, self.tenant_budget(tenant)):
+            if limiter is not None:
+                limiter.record(response.usage, response.model)
 
     def preflight(self, probe: bool = False) -> dict:
         """Check every route *before* an outage forces the gateway to use it.
@@ -103,14 +136,35 @@ class GatewayProvider(BaseProvider):
         # take, and replaying a stale action is worse than paying for a call.
         cacheable = self.cache is not None and not tools and not opts.get("no_cache", False)
         text = prompt_text(messages)
+        # Conversation identity for sticky routing: everything up to and
+        # including the first user message, which is the same on every turn.
+        head = []
+        for m in messages:
+            head.append(f"{getattr(m.role, 'value', m.role)}:{m.content}")
+            if getattr(m.role, "value", m.role) == "user":
+                break
+        loop_key = hashlib.sha256("|".join(head).encode()).hexdigest()
+        candidates = fallback_order(self.routes, tier)
+        # Sticky tool loops. Once a conversation contains tool results, its
+        # history holds provider-specific state (for Gemini 3, thought
+        # signatures on function-call parts) that another model rejects or
+        # mishandles. Failing over in the middle of a tool loop therefore
+        # breaks it; the loop stays on the route that started it, and if that
+        # route fails the error goes to the caller, which restarts the whole
+        # task on another route.
+        in_tool_loop = any(getattr(m.role, "value", m.role) == "tool" for m in messages)
+        if in_tool_loop and loop_key in self._loop_routes:
+            candidates = [self._loop_routes[loop_key]]
         return {
+            "has_tools": bool(tools),
+            "loop_key": loop_key,
             "request_id": uuid.uuid4().hex[:12],
             "tenant": tenant,
             "tier": tier,
             "cacheable": cacheable,
             "text": text,
             "scope": make_scope(tenant, messages),
-            "candidates": fallback_order(self.routes, tier),
+            "candidates": candidates,
         }
 
     def _record(self, plan, t0, outcome, route=None, response=None, attempts=None, cost=0.0, sim=None):
@@ -141,8 +195,10 @@ class GatewayProvider(BaseProvider):
         # OpenTelemetry GenAI semantic conventions (still marked
         # "Development" upstream, names can change): gen_ai.* for the model
         # call, gateway.* for what only a gateway knows.
+        # gen_ai.* names and the provider-name mapping come from Requisite
+        # (0.39.0+), so the lab and the framework share one vocabulary.
         attrs: dict[str, Any] = {
-            "gen_ai.operation.name": "chat",
+            GEN_AI_OPERATION_NAME: "chat",
             "gateway.request_id": plan["request_id"],
             "gateway.tenant": plan["tenant"],
             "gateway.tier": plan["tier"],
@@ -151,24 +207,30 @@ class GatewayProvider(BaseProvider):
             "gateway.cost_usd": rec.cost_usd,
         }
         if route is not None and response is not None:
+            attrs.update(genai_request_attributes(response.provider, route.provider.model))
             attrs.update({
-                "gen_ai.provider.name": response.provider,
-                "gen_ai.request.model": route.provider.model,
-                "gen_ai.response.model": response.model,
-                "gen_ai.usage.input_tokens": response.usage.prompt_tokens,
-                "gen_ai.usage.output_tokens": response.usage.completion_tokens,
+                GEN_AI_RESPONSE_MODEL: response.model,
+                GEN_AI_USAGE_INPUT_TOKENS: response.usage.prompt_tokens,
+                GEN_AI_USAGE_OUTPUT_TOKENS: response.usage.completion_tokens,
                 "gateway.route": route.name,
             })
         return attrs
+
+    def _annotate(self, span, plan, route, response, rec) -> None:
+        for k, v in self._span_attrs(plan, route, response, rec).items():
+            span.set_attribute(k, v)
 
     def _cache_response(self, hit) -> ChatResponse:
         return hit.response.model_copy(update={"provider": "gateway-cache"})
 
     def _finish_ok(self, plan, t0, route, response, attempts, store_cache=True):
         cost = route.cost_fn(response.usage, response.model)
-        if self.cost_limiter is not None:
-            self.cost_limiter.record(response.usage, response.model)
+        self._record_spend(plan["tenant"], response)
         route.breaker.record_success()
+        if plan["has_tools"]:
+            self._loop_routes[plan["loop_key"]] = route
+            while len(self._loop_routes) > 1024:
+                self._loop_routes.pop(next(iter(self._loop_routes)))
         # Structured (parsed) responses are not cached: the parsed object is not
         # guaranteed to survive a copy, and a cached text-only hit would drop it.
         if store_cache and plan["cacheable"] and response.parsed is None:
@@ -189,14 +251,13 @@ class GatewayProvider(BaseProvider):
         t0 = time.perf_counter()
         plan = self._plan(messages, tools, response_model, kwargs)
         with _tracer.start_as_current_span("gateway.chat") as span:
-            if self.cost_limiter is not None:
-                try:
-                    self.cost_limiter.check()
-                except CostLimitException:
-                    rec = self._record(plan, t0, "blocked_budget")
-                    for k, v in self._span_attrs(plan, None, None, rec).items():
-                        span.set_attribute(k, v)
-                    raise
+            try:
+                self._check_budgets(plan["tenant"])
+            except CostLimitException:
+                rec = self._record(plan, t0, "blocked_budget")
+                for k, v in self._span_attrs(plan, None, None, rec).items():
+                    span.set_attribute(k, v)
+                raise
 
             if plan["cacheable"]:
                 hit = self.cache.lookup(plan["scope"], plan["text"])
@@ -245,40 +306,46 @@ class GatewayProvider(BaseProvider):
     ) -> ChatResponse:
         t0 = time.perf_counter()
         plan = self._plan(messages, tools, response_model, kwargs)
-        if self.cost_limiter is not None:
+        # Same span as the sync path: orchestrators such as ADK drive agents
+        # through the async API, and the gateway must be visible in those traces.
+        with _tracer.start_as_current_span("gateway.chat") as span:
             try:
-                self.cost_limiter.check()
+                self._check_budgets(plan["tenant"])
             except CostLimitException:
-                self._record(plan, t0, "blocked_budget")
+                rec = self._record(plan, t0, "blocked_budget")
+                self._annotate(span, plan, None, None, rec)
                 raise
-        if plan["cacheable"]:
-            # The cache's embedding call is synchronous; keep it off the event loop.
-            hit = await asyncio.to_thread(self.cache.lookup, plan["scope"], plan["text"])
-            if hit:
-                self._record(plan, t0, f"cache_{hit.kind}", "cache", hit.response, [], 0.0, hit.similarity)
-                return self._cache_response(hit)
-        attempts: list[dict] = []
-        for route in plan["candidates"]:
-            if not route.breaker.allow():
-                attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
-                continue
-            try:
-                response = await route.provider.achat(
-                    messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs
-                )
-            except Exception as exc:
-                route.breaker.record_failure()
-                attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
-                continue
-            attempts.append({"route": route.name, "ok": True, "error": None})
-            if plan["cacheable"] and response.parsed is None:
-                await asyncio.to_thread(self.cache.store, plan["scope"], plan["text"], response)
-            self._finish_ok(plan, t0, route, response, attempts, store_cache=False)
-            return response
-        self._record(plan, t0, "exhausted", None, None, attempts)
-        raise GatewayExhausted(
-            f"All routes failed or were skipped: {attempts}", provider="gateway", details={"attempts": attempts}
-        )
+            if plan["cacheable"]:
+                # The cache's embedding call is synchronous; keep it off the event loop.
+                hit = await asyncio.to_thread(self.cache.lookup, plan["scope"], plan["text"])
+                if hit:
+                    rec = self._record(plan, t0, f"cache_{hit.kind}", "cache", hit.response, [], 0.0, hit.similarity)
+                    self._annotate(span, plan, None, None, rec)
+                    return self._cache_response(hit)
+            attempts: list[dict] = []
+            for route in plan["candidates"]:
+                if not route.breaker.allow():
+                    attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
+                    continue
+                try:
+                    response = await route.provider.achat(
+                        messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs
+                    )
+                except Exception as exc:
+                    route.breaker.record_failure()
+                    attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                    continue
+                attempts.append({"route": route.name, "ok": True, "error": None})
+                if plan["cacheable"] and response.parsed is None:
+                    await asyncio.to_thread(self.cache.store, plan["scope"], plan["text"], response)
+                rec = self._finish_ok(plan, t0, route, response, attempts, store_cache=False)
+                self._annotate(span, plan, route, response, rec)
+                return response
+            rec = self._record(plan, t0, "exhausted", None, None, attempts)
+            self._annotate(span, plan, None, None, rec)
+            raise GatewayExhausted(
+                f"All routes failed or were skipped: {attempts}", provider="gateway", details={"attempts": attempts}
+            )
 
     # -- streaming: failover only before the first chunk ---------------------
     # Once a chunk has reached the caller the response is partly delivered; a

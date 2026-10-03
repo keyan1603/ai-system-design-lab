@@ -9,3 +9,5 @@ baselines/*.json
 install.log
 *_post_draft.md
 *.png
+audit/**/*.jsonl
+audit/**/*.json

@@ -47,6 +47,17 @@ def default_classifier(messages: Sequence[Message], has_tools: bool, has_schema:
     return LIGHT
 
 
+def degraded_routes_used(records, routes: Sequence[Route]) -> list[str]:
+    """Names of degraded-tier routes that served any of these audit records.
+
+    Failover keeps the system available; it does not keep the answers as good.
+    Downstream code uses this to stop treating a degraded-model answer as
+    equivalent to a normal one (hold it for review, label it, or alert).
+    """
+    degraded = {r.name for r in routes if r.tier == DEGRADED}
+    return sorted({rec.route for rec in records if rec.route in degraded})
+
+
 def fallback_order(routes: Sequence[Route], tier: str) -> list[Route]:
     """Routes to try, in order, for a request classified as ``tier``.
 

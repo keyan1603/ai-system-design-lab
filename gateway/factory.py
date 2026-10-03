@@ -48,11 +48,23 @@ def gemini_cost_fn(model: str) -> CostFn:
     return _cost
 
 
+def model_cost_fn(usage, model: str) -> float:
+    """Price a response by the model that actually answered (limiters need this:
+    a budget shared across tiers must not price a heavy call at light rates).
+    Models with no published price here, such as the local one, cost 0."""
+    name = model.removeprefix("models/")
+    return gemini_cost_fn(name)(usage, name) if name in PRICES_PER_1M else 0.0
+
+
 def build_gateway(
     *,
     with_faults: bool = False,
     cache_threshold: float = 0.90,
     budget_usd: Optional[float] = None,
+    tenant_budget_usd: Optional[float] = None,
+    use_cache: bool = True,
+    classifier=None,
+    limiter: Optional[RateLimiter] = None,
     audit_path: Optional[str] = None,
     breaker_reset_s: float = 30.0,
 ):
@@ -62,7 +74,9 @@ def build_gateway(
     rpm = int(os.environ.get("REQUESTS_PER_MINUTE", "15"))
 
     # Both Gemini routes draw on one API key, so they share ONE limiter instance.
-    limiter = RateLimiter(requests_per_minute=rpm)
+    # Pass one `limiter` to several gateways that share an API key: two
+    # limiter instances do not know about each other and together can exceed the quota.
+    limiter = limiter or RateLimiter(requests_per_minute=rpm)
     light = RateLimitedProvider(GeminiProvider(api_key=key, model=light_model), limiter)
     heavy = RateLimitedProvider(GeminiProvider(api_key=key, model=heavy_model), limiter)
     local = OllamaProvider(model="llama3.2:1b", timeout=180.0)
@@ -79,11 +93,13 @@ def build_gateway(
     ]
     embedder = GeminiEmbeddingProvider(api_key=key, model=os.environ.get("EMBEDDING_MODEL", "gemini-embedding-2"))
     cache = SemanticCache(embedder.embed_one, threshold=cache_threshold)
-    spend_cap = CostLimiter(budget_usd=budget_usd, cost_fn=gemini_cost_fn(light_model)) if budget_usd else None
+    spend_cap = CostLimiter(budget_usd=budget_usd, cost_fn=model_cost_fn) if budget_usd else None
     gw = GatewayProvider(
         routes,
-        cache=cache,
+        cache=cache if use_cache else None,
+        **({"classifier": classifier} if classifier else {}),
         cost_limiter=spend_cap,
+        tenant_budgets=(lambda _t: CostLimiter(budget_usd=tenant_budget_usd, cost_fn=model_cost_fn)) if tenant_budget_usd else None,
         audit=AuditLog(path=audit_path),
     )
     return gw, faults

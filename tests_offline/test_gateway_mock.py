@@ -321,3 +321,83 @@ def test_rate_limited_provider_acquires_before_each_call():
     p = RateLimitedProvider(inner, Counting())
     p.chat(user("x")); p.chat(user("y"))
     assert Counting.n == 2 and inner.calls == 2
+
+
+# ---- per-tenant budgets, tenant pinning ----------------------------------------------
+def test_tenant_budget_blocks_only_that_tenant():
+    gw = GatewayProvider([route("l", LIGHT)],
+                         tenant_budgets=lambda t: CostLimiter(budget_usd=0.15, cost_fn=COST))
+    gw.chat(user("a"), tenant="acme")                 # $0.20 spent, over acme's $0.15 cap
+    with pytest.raises(CostLimitException):
+        gw.chat(user("b"), tenant="acme")
+    assert gw.chat(user("c"), tenant="globex").content == "ok"   # globex unaffected
+    assert gw.audit.records[-2].outcome == "blocked_budget"
+
+
+def test_global_budget_still_applies_above_tenant_budgets():
+    gw = GatewayProvider([route("l", LIGHT)], cost_limiter=CostLimiter(budget_usd=0.15, cost_fn=COST),
+                         tenant_budgets=lambda t: CostLimiter(budget_usd=100, cost_fn=COST))
+    gw.chat(user("a"), tenant="acme")
+    with pytest.raises(CostLimitException):
+        gw.chat(user("b"), tenant="globex")           # fleet ceiling reached by someone else's spend
+
+
+def test_tenant_provider_pins_tenant_for_audit_and_cache_scope():
+    from gateway.tenant import TenantProvider
+    light = route("l", LIGHT)
+    gw = GatewayProvider([light], cache=SemanticCache(toy_embed))
+    a, b = TenantProvider(gw, "acme"), TenantProvider(gw, "globex")
+    a.chat(user("same text")); b.chat(user("same text"))
+    assert light.provider.calls == 2
+    assert [r.tenant for r in gw.audit.records] == ["acme", "globex"]
+
+
+def test_async_path_emits_gateway_span_too():
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    tp = trace.get_tracer_provider()
+    if not hasattr(tp, "add_span_processor"):       # a real provider was not installed by an earlier test
+        tp = TracerProvider(); trace.set_tracer_provider(tp)
+    tp.add_span_processor(SimpleSpanProcessor(exporter))
+    gw = GatewayProvider([route("l", LIGHT)])
+    asyncio.run(gw.achat(user("hi"), tenant="t9"))
+    spans = [s for s in exporter.get_finished_spans() if s.name == "gateway.chat"]
+    assert spans and spans[-1].attributes["gateway.tenant"] == "t9" and spans[-1].attributes["gateway.route"] == "l"
+
+
+# ---- sticky tool loops, degraded-tier detection --------------------------------------
+def tool_msg():
+    return Message(role=Role.TOOL, content="result", name="t", tool_call_id="1")
+
+
+def test_tool_loop_stays_on_the_route_that_started_it_and_never_fails_over():
+    flaky = FakeProvider("l", fail_next=0)
+    gw = GatewayProvider([route("l", LIGHT, flaky), route("h", HEAVY)])
+    first = [Message(role=Role.USER, content="do the task")]
+    gw.chat(first, tools=[object()], tier=LIGHT)                     # turn 1 served by l, loop pinned to l
+    flaky.fail_next = 5
+    loop = first + [Message(role=Role.ASSISTANT, content=""), tool_msg()]
+    with pytest.raises(GatewayExhausted):                             # l fails mid-loop: must NOT hop to h
+        gw.chat(loop, tools=[object()], tier=LIGHT)
+    assert gw.routes[1].provider.calls == 0
+    assert [a["route"] for a in gw.audit.records[-1].attempts] == ["l"]
+
+
+def test_first_turn_of_a_tool_conversation_can_still_fail_over():
+    gw = GatewayProvider([route("l", LIGHT, FakeProvider("l", fail_next=9)), route("h", HEAVY)])
+    resp = gw.chat(user("start the task"), tools=[object()])
+    assert resp.provider == "h"
+
+
+def test_degraded_routes_used_reports_only_degraded_tier():
+    from gateway.routing import degraded_routes_used
+    gw = GatewayProvider([route("l", LIGHT, FakeProvider("l", fail_next=9)), route("d", DEGRADED)])
+    gw.chat(user("a"))
+    assert degraded_routes_used(gw.audit.records, gw.routes) == ["d"]
+    ok = GatewayProvider([route("l", LIGHT), route("d", DEGRADED)])
+    ok.chat(user("a"))
+    assert degraded_routes_used(ok.audit.records, ok.routes) == []
