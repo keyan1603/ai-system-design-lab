@@ -1,0 +1,11 @@
+venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+traces/*.jsonl
+audit/*.jsonl
+baselines/*.json
+install.log
+*_post_draft.md
+*.png

@@ -1,0 +1,350 @@
+"""GatewayProvider: an in-process AI gateway that *is* a Requisite provider.
+
+Because it subclasses `requisite.providers.base.BaseProvider`, anything in the
+framework that accepts a provider accepts the gateway: `AI(provider=gw)`,
+`Agent(provider=gw)`, and therefore every orchestrator backend (native, ADK,
+OpenAI Agents, Strands, ...). Routing, caching, failover, budgets and audit
+apply to every model call without any caller knowing the gateway exists.
+
+What it deliberately is NOT: a network service. A shared multi-tenant gateway
+(virtual keys, per-team quotas, a dashboard) belongs at the deployment tier,
+and the Phase 5/6 write-up compares that buy-vs-build choice. This class is
+the in-process policy engine such a service would embed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import time
+import uuid
+from collections.abc import AsyncIterator, Iterator, Sequence
+from typing import Any, Optional
+
+from pydantic import BaseModel
+from requisite.core.cost_limiter import CostLimiter
+from requisite.core.exceptions import CostLimitException, ProviderException
+from requisite.core.interfaces import ChatResponse, Message, Role, StreamChunk
+from requisite.providers.base import BaseProvider
+from requisite.telemetry.otel import get_tracer
+
+from gateway.audit import AuditLog, AuditRecord
+from gateway.cache import SemanticCache, make_scope, prompt_text
+from gateway.routing import Classifier, Route, default_classifier, fallback_order
+
+_tracer = get_tracer("ai_system_design.gateway")
+
+# kwargs consumed by the gateway itself, never forwarded to a provider
+_GATEWAY_KWARGS = ("tenant", "tier", "no_cache")
+
+
+class GatewayExhausted(ProviderException):
+    """Every eligible route failed or was skipped by its circuit breaker."""
+
+
+class GatewayProvider(BaseProvider):
+    def __init__(
+        self,
+        routes: Sequence[Route],
+        *,
+        classifier: Classifier = default_classifier,
+        cache: Optional[SemanticCache] = None,
+        cost_limiter: Optional[CostLimiter] = None,
+        audit: Optional[AuditLog] = None,
+        default_tenant: str = "default",
+    ) -> None:
+        if not routes:
+            raise ValueError("GatewayProvider needs at least one route")
+        super().__init__(api_key="gateway", model=routes[0].provider.model, timeout=0)
+        self.routes = list(routes)
+        self.classifier = classifier
+        self.cache = cache
+        self.cost_limiter = cost_limiter
+        self.audit = audit or AuditLog()
+        self.default_tenant = default_tenant
+
+    # -- BaseProvider surface -------------------------------------------------
+    @property
+    def name(self) -> str:
+        return "gateway"
+
+    @property
+    def model(self) -> str:
+        return "gateway-routed"
+
+    def validate_config(self) -> None:
+        for r in self.routes:
+            r.provider.validate_config()
+
+    def preflight(self, probe: bool = False) -> dict:
+        """Check every route *before* an outage forces the gateway to use it.
+
+        A fallback route that has never been exercised is a hope, not a
+        control: a missing SDK extra or a stopped local server only shows up
+        at the worst moment. ``probe=True`` makes one tiny real call per route.
+        """
+        report = {}
+        for r in self.routes:
+            try:
+                r.provider.validate_config()
+                if probe:
+                    r.provider.chat([Message(role=Role.USER, content="ping")], temperature=0.0)
+                report[r.name] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                report[r.name] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        return report
+
+    # -- shared planning / bookkeeping ---------------------------------------
+    def _plan(self, messages, tools, response_model, kwargs):
+        opts = {k: kwargs.pop(k) for k in _GATEWAY_KWARGS if k in kwargs}
+        tenant = opts.get("tenant", self.default_tenant)
+        tier = opts.get("tier") or self.classifier(messages, bool(tools), response_model is not None)
+        # Tool-calling responses are never cached: they describe an action to
+        # take, and replaying a stale action is worse than paying for a call.
+        cacheable = self.cache is not None and not tools and not opts.get("no_cache", False)
+        text = prompt_text(messages)
+        return {
+            "request_id": uuid.uuid4().hex[:12],
+            "tenant": tenant,
+            "tier": tier,
+            "cacheable": cacheable,
+            "text": text,
+            "scope": make_scope(tenant, messages),
+            "candidates": fallback_order(self.routes, tier),
+        }
+
+    def _record(self, plan, t0, outcome, route=None, response=None, attempts=None, cost=0.0, sim=None):
+        rec = AuditRecord(
+            request_id=plan["request_id"],
+            tenant=plan["tenant"],
+            tier=plan["tier"],
+            outcome=outcome,
+            route=route,
+            model=getattr(response, "model", None),
+            attempts=attempts or [],
+            prompt_sha256=hashlib.sha256(plan["text"].encode()).hexdigest(),
+            prompt_chars=len(plan["text"]),
+            # A cache hit consumed no tokens; the tokens the cached answer
+            # originally cost are reported separately as savings.
+            input_tokens=response.usage.prompt_tokens if response and not outcome.startswith("cache") else 0,
+            output_tokens=response.usage.completion_tokens if response and not outcome.startswith("cache") else 0,
+            saved_tokens=(response.usage.prompt_tokens + response.usage.completion_tokens) if response and outcome.startswith("cache") else 0,
+            cost_usd=cost,
+            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+            cache_similarity=sim,
+            prompt=plan["text"],
+        )
+        self.audit.write(rec)
+        return rec
+
+    def _span_attrs(self, plan, route: Optional[Route], response: Optional[ChatResponse], rec: AuditRecord) -> dict:
+        # OpenTelemetry GenAI semantic conventions (still marked
+        # "Development" upstream, names can change): gen_ai.* for the model
+        # call, gateway.* for what only a gateway knows.
+        attrs: dict[str, Any] = {
+            "gen_ai.operation.name": "chat",
+            "gateway.request_id": plan["request_id"],
+            "gateway.tenant": plan["tenant"],
+            "gateway.tier": plan["tier"],
+            "gateway.outcome": rec.outcome,
+            "gateway.attempts": len(rec.attempts),
+            "gateway.cost_usd": rec.cost_usd,
+        }
+        if route is not None and response is not None:
+            attrs.update({
+                "gen_ai.provider.name": response.provider,
+                "gen_ai.request.model": route.provider.model,
+                "gen_ai.response.model": response.model,
+                "gen_ai.usage.input_tokens": response.usage.prompt_tokens,
+                "gen_ai.usage.output_tokens": response.usage.completion_tokens,
+                "gateway.route": route.name,
+            })
+        return attrs
+
+    def _cache_response(self, hit) -> ChatResponse:
+        return hit.response.model_copy(update={"provider": "gateway-cache"})
+
+    def _finish_ok(self, plan, t0, route, response, attempts, store_cache=True):
+        cost = route.cost_fn(response.usage, response.model)
+        if self.cost_limiter is not None:
+            self.cost_limiter.record(response.usage, response.model)
+        route.breaker.record_success()
+        # Structured (parsed) responses are not cached: the parsed object is not
+        # guaranteed to survive a copy, and a cached text-only hit would drop it.
+        if store_cache and plan["cacheable"] and response.parsed is None:
+            self.cache.store(plan["scope"], plan["text"], response)
+        return self._record(plan, t0, "ok", route.name, response, attempts, cost)
+
+    # -- sync chat -----------------------------------------------------------
+    def chat(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        tools: Optional[Sequence[Any]] = None,
+        response_model: Optional[type[BaseModel]] = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        t0 = time.perf_counter()
+        plan = self._plan(messages, tools, response_model, kwargs)
+        with _tracer.start_as_current_span("gateway.chat") as span:
+            if self.cost_limiter is not None:
+                try:
+                    self.cost_limiter.check()
+                except CostLimitException:
+                    rec = self._record(plan, t0, "blocked_budget")
+                    for k, v in self._span_attrs(plan, None, None, rec).items():
+                        span.set_attribute(k, v)
+                    raise
+
+            if plan["cacheable"]:
+                hit = self.cache.lookup(plan["scope"], plan["text"])
+                if hit:
+                    rec = self._record(plan, t0, f"cache_{hit.kind}", "cache", hit.response, [], 0.0, hit.similarity)
+                    for k, v in self._span_attrs(plan, None, None, rec).items():
+                        span.set_attribute(k, v)
+                    return self._cache_response(hit)
+
+            attempts: list[dict] = []
+            for route in plan["candidates"]:
+                if not route.breaker.allow():
+                    attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
+                    continue
+                try:
+                    response = route.provider.chat(
+                        messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs
+                    )
+                except Exception as exc:  # any provider/transport failure triggers failover
+                    route.breaker.record_failure()
+                    attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                    continue
+                attempts.append({"route": route.name, "ok": True, "error": None})
+                rec = self._finish_ok(plan, t0, route, response, attempts)
+                for k, v in self._span_attrs(plan, route, response, rec).items():
+                    span.set_attribute(k, v)
+                return response
+
+            rec = self._record(plan, t0, "exhausted", None, None, attempts)
+            for k, v in self._span_attrs(plan, None, None, rec).items():
+                span.set_attribute(k, v)
+            raise GatewayExhausted(
+                f"All routes failed or were skipped: {attempts}", provider="gateway", details={"attempts": attempts}
+            )
+
+    # -- async chat ----------------------------------------------------------
+    async def achat(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        tools: Optional[Sequence[Any]] = None,
+        response_model: Optional[type[BaseModel]] = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
+        t0 = time.perf_counter()
+        plan = self._plan(messages, tools, response_model, kwargs)
+        if self.cost_limiter is not None:
+            try:
+                self.cost_limiter.check()
+            except CostLimitException:
+                self._record(plan, t0, "blocked_budget")
+                raise
+        if plan["cacheable"]:
+            # The cache's embedding call is synchronous; keep it off the event loop.
+            hit = await asyncio.to_thread(self.cache.lookup, plan["scope"], plan["text"])
+            if hit:
+                self._record(plan, t0, f"cache_{hit.kind}", "cache", hit.response, [], 0.0, hit.similarity)
+                return self._cache_response(hit)
+        attempts: list[dict] = []
+        for route in plan["candidates"]:
+            if not route.breaker.allow():
+                attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
+                continue
+            try:
+                response = await route.provider.achat(
+                    messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs
+                )
+            except Exception as exc:
+                route.breaker.record_failure()
+                attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+            attempts.append({"route": route.name, "ok": True, "error": None})
+            if plan["cacheable"] and response.parsed is None:
+                await asyncio.to_thread(self.cache.store, plan["scope"], plan["text"], response)
+            self._finish_ok(plan, t0, route, response, attempts, store_cache=False)
+            return response
+        self._record(plan, t0, "exhausted", None, None, attempts)
+        raise GatewayExhausted(
+            f"All routes failed or were skipped: {attempts}", provider="gateway", details={"attempts": attempts}
+        )
+
+    # -- streaming: failover only before the first chunk ---------------------
+    # Once a chunk has reached the caller the response is partly delivered; a
+    # silent restart on another model would splice two different answers
+    # together, so a mid-stream failure is surfaced, not retried.
+    def stream(self, messages, *, model=None, temperature=None, tools=None, **kwargs) -> Iterator[StreamChunk]:
+        t0 = time.perf_counter()
+        plan = self._plan(messages, tools, None, kwargs)
+        attempts: list[dict] = []
+        for route in plan["candidates"]:
+            if not route.breaker.allow():
+                attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
+                continue
+            it = route.provider.stream(messages, temperature=temperature, tools=tools, **kwargs)
+            try:
+                first = next(it)
+            except StopIteration:
+                route.breaker.record_success()
+                attempts.append({"route": route.name, "ok": True, "error": None})
+                self._record(plan, t0, "ok", route.name, None, attempts)
+                return
+            except Exception as exc:
+                route.breaker.record_failure()
+                attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+            attempts.append({"route": route.name, "ok": True, "error": None})
+            try:
+                yield first
+                yield from it
+            except Exception:
+                route.breaker.record_failure()
+                raise
+            route.breaker.record_success()
+            self._record(plan, t0, "ok", route.name, None, attempts)
+            return
+        self._record(plan, t0, "exhausted", None, None, attempts)
+        raise GatewayExhausted(
+            f"All routes failed or were skipped: {attempts}", provider="gateway", details={"attempts": attempts}
+        )
+
+    async def astream(self, messages, *, model=None, temperature=None, tools=None, **kwargs) -> AsyncIterator[StreamChunk]:
+        plan = self._plan(messages, tools, None, kwargs)
+        attempts: list[dict] = []
+        for route in plan["candidates"]:
+            if not route.breaker.allow():
+                attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
+                continue
+            it = route.provider.astream(messages, temperature=temperature, tools=tools, **kwargs).__aiter__()
+            try:
+                first = await it.__anext__()
+            except StopAsyncIteration:
+                route.breaker.record_success()
+                return
+            except Exception as exc:
+                route.breaker.record_failure()
+                attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+            yield first
+            try:
+                async for chunk in it:
+                    yield chunk
+            except Exception:
+                route.breaker.record_failure()
+                raise
+            route.breaker.record_success()
+            return
+        raise GatewayExhausted(
+            f"All routes failed or were skipped: {attempts}", provider="gateway", details={"attempts": attempts}
+        )
