@@ -2,3 +2,5 @@ requisite-ai[gemini,adk,otel,mcp,rag,ollama]>=0.41.0  # 0.39.0 adds the gen_ai s
 python-dotenv
 tabulate
 pytest
+google-adk[a2a]>=2.11
+httpx
