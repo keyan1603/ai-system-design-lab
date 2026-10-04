@@ -8,7 +8,7 @@ apply to every model call without any caller knowing the gateway exists.
 
 What it deliberately is NOT: a network service. A shared multi-tenant gateway
 (virtual keys, per-team quotas, a dashboard) belongs at the deployment tier,
-and the Phase 5/6 write-up compares that buy-vs-build choice. This class is
+and docs/decisions.md compares that buy-vs-build choice. This class is
 the in-process policy engine such a service would embed.
 """
 
@@ -158,7 +158,7 @@ class GatewayProvider(BaseProvider):
     def _plan(self, messages, tools, response_model, kwargs):
         opts = {k: kwargs.pop(k) for k in _GATEWAY_KWARGS if k in kwargs}
         # Tenant and correlation id come from Requisite's request-scoped context
-        # (0.42.0+) unless a caller passes `tenant=` explicitly; no wrapper has to carry them.
+        # (Requisite 0.42.0+) unless a caller passes `tenant=` explicitly; no wrapper has to carry them.
         ctx = current_context()
         tenant = opts.get("tenant") or (ctx.tenant if ctx and ctx.tenant else self.default_tenant)
         tier = opts.get("tier") or self.classifier(messages, bool(tools), response_model is not None)

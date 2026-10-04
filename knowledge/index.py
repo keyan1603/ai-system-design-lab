@@ -8,11 +8,6 @@ chunk is never a candidate and cannot influence the rank or score of allowed
 chunks. A user with no groups gets `{"$in": []}`, which matches nothing
 (default deny). Authorization is enforced here, in code, never by asking the
 model to behave.
-
-History: on Requisite 0.40.0 the retrievers took no filter and the store
-filter was exact equality only, so this module stamped one boolean flag per
-group and ran one store search per group. Those gaps were reported from this
-lab and closed in 0.41.0; the workaround is gone.
 """
 
 from __future__ import annotations

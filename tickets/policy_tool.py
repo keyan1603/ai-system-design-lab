@@ -6,7 +6,7 @@ agent whose groups are capped by the ticket agent's own ceiling (see
 identity/tokens.py). The knowledge agent therefore enforces the operator's
 access, further limited to what this service is allowed to lend.
 
-How the tool knows whose ticket it is (Requisite 0.42.0): it declares a
+How the tool knows whose ticket it is (Requisite request context): it declares a
 `RequestContext` parameter, which Requisite injects and hides from the model.
 The operator's *credential* is deliberately not in that context (a context is
 for identity and tracing, and can end up in logs); it sits in a service-side

@@ -1,4 +1,4 @@
-"""Phase 5 live run: what happens to the system when each dependency fails?
+"""Live run: what happens to the system when each dependency fails?
 
 Every scenario injects one failure into a REAL pipeline (real models, real MCP
 server, real A2A service) and records what the system did: the signal that

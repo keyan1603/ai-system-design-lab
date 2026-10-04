@@ -1,4 +1,4 @@
-"""Phase 1 live demo: the gateway in front of real Gemini and local Ollama models.
+"""Live demo: the gateway in front of real Gemini and local Ollama models.
 
 Six scenarios, each printing real audit records. Outage scenarios use the
 FaultInjector (an *injected* failure in front of a real provider), and are

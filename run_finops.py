@@ -1,4 +1,4 @@
-"""Phase 5 FinOps study: what does each path cost, what does a cache save, where does hosting break even?
+"""FinOps study: what does each path cost, what does a cache save, where does hosting break even?
 
 Measured (real runs): tokens, dollars at published paid-tier prices, and latency per ticket and per question,
 read from the gateway audit logs of the earlier runs; plus a live cache experiment on a repeated workload.
@@ -102,7 +102,7 @@ def projections(unit_costs, cache):
     per_q = unit_costs["question"]
     for host in (100, 500, 2_000, 10_000):
         be = host / (30 * per_q)
-        rows.append([f"${host:,}/month", f"{be:,.0f} questions/day", "quality and operations NOT included: the local 1B model failed the refusal rule in Phase 4"])
+        rows.append([f"${host:,}/month", f"{be:,.0f} questions/day", "quality and operations NOT included: the local 1B model failed the refusal rule in the drift study"])
     print(tabulate(rows, headers=["assumed hosting cost", "break-even volume vs hosted flash-lite", "caveat"], tablefmt="github"))
 
 

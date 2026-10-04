@@ -1,4 +1,4 @@
-"""Phase 4 live run: system drift monitoring on the knowledge assistant.
+"""Live run: system drift monitoring on the knowledge assistant.
 
     1. baseline   a reviewed run on the normal configuration (saved deliberately)
     2. repeat     the same configuration again: must read as stable (tolerance for model noise)

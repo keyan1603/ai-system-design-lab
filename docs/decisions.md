@@ -6,7 +6,7 @@ Short decision records, each tied to something measured in this lab. They are th
 - **Context.** Two scenarios share one model and one corpus, but users may read different documents.
 - **Decision.** Every chunk carries the groups allowed to read it. Every retrieval for a user passes a filter built from that user's verified groups, applied inside the store and to every retrieval path, before ranking. No groups means no results.
 - **Evidence.** Same model, same 13 questions: filter on, 13/13 correct and 0 of 5 restricted documents leaked; filter off, 8/13 and 5/5 leaked, and the citation check passed every leak.
-- **Consequences.** A grounding check is not an authorization control. Any retrieval product adopted later must be tested for a filter that runs before ranking and covers the keyword path (Requisite's `HybridRetriever` once did not, fixed in 0.41.0).
+- **Consequences.** A grounding check is not an authorization control. Any retrieval product adopted later must be tested for a filter that runs before ranking and covers the keyword path as well as the semantic one (Requisite's `HybridRetriever` with a filter does both).
 
 ## D2. A gateway sits between every agent and every model
 - **Context.** Agents call models in many places; routing, quota, budget and audit cannot be left to each caller.
@@ -41,7 +41,7 @@ Short decision records, each tied to something measured in this lab. They are th
 ## D7. Every dependency failure ends in a defined outcome
 - **Context.** A support pipeline that raises loses tickets.
 - **Decision.** Each failure becomes a held or withheld outcome with a reason: no ungrounded answer when retrieval is down, no guessed policy when the policy agent is down, no crash when a budget is exhausted or a tool server will not start.
-- **Evidence.** Seven injected failures against real pipelines: seven defined outcomes, no restricted fact in any answer (see `phase5_failure_study.log`).
+- **Evidence.** Seven injected failures against real pipelines: seven defined outcomes, no restricted fact in any answer (`run_failure_study.py`).
 - **Consequences.** A tool that cannot answer is a degraded capability: the ticket is held when a requested fact is missing, not released as complete.
 
 ## D8. One orchestration coordinator is not a one-way door

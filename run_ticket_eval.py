@@ -1,4 +1,4 @@
-"""Phase 2 live run: the ticket platform on real models, scored against labelled tickets.
+"""Live run: the ticket platform on real models, scored against labelled tickets.
 
     python -u run_ticket_eval.py                 # both backends, all tickets
     python -u run_ticket_eval.py --backend adk --only T01

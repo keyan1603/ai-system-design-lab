@@ -7,7 +7,7 @@ Two lookups, cheapest first:
 2. Embedding similarity above a threshold, within the same scope. Catches
    rephrasings, at the price of one embedding call per miss and a nonzero
    chance of returning an answer to a *different* question. That risk is why
-   the threshold is explicit and why Phase 5 measures it instead of assuming.
+   the threshold is explicit and why run_finops.py measures it instead of assuming.
 
 Every entry is stored under a *scope* (tenant, plus a hash of the system
 prompt). A cache that ignores scope is a cross-tenant data leak waiting to

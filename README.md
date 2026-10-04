@@ -1,179 +1,135 @@
 # ai-system-design-lab
 
-Companion repo for the AI System Design post in the AI/agents blog series. It is built **phase by phase**; this is the state after **Phase 1: the gateway layer**.
+A runnable reference system for designing enterprise AI: one AI gateway, two real scenarios (a support-ticket platform and an enterprise knowledge assistant), agent-to-agent calls with verified identity, drift monitoring, a failure-mode study and a cost study. Every claim in the companion blog post, *How to Design an AI System That Doesn't Leak, Lie or Fall Over*, comes from code and measurements in this repo.
 
-The goal is one reference system serving two scenarios (a support-ticket platform and an enterprise knowledge assistant) on top of [Requisite](https://github.com/keyan1603/requisite-ai), Google ADK and the provider SDKs, with the architecture decisions made explicit and measured.
+It is built on [Requisite](https://github.com/keyan1603/requisite-ai) (providers, agents, multi-agent workflows, RAG, MCP, rate and cost limits, tracing), Google's Agent Development Kit (ADK, including its A2A support), and the provider SDKs. Requisite supplies the building blocks; this repo adds the policy layer on top: gateway, guardrails, access control, identity and monitoring.
 
-## Phase 1: `gateway/`
+## Architecture
 
-An in-process AI gateway that **is** a Requisite provider (`GatewayProvider(BaseProvider)`), so it plugs into `AI`, `Agent` and every orchestrator backend unchanged.
+```
+operator --login--> ticket platform ------A2A over HTTP, delegated identity------> knowledge assistant
+                    (triage, resolver, responder)                                 (access-filtered retrieval, cited answers)
+                           |                                                                |
+                           +-------------------- every model call --------------------------+
+                                                         |
+                                                    AI gateway
+                          tier routing, failover, circuit breakers, timeouts, rate limits,
+                          semantic cache, per-tenant budgets, audit record per request
+                                                         |
+                          Gemini light | Gemini heavy | local Ollama model (degraded tier)
+```
 
-| Module | What it does |
+| Layer | What it does | Where |
+|---|---|---|
+| AI gateway | A Requisite provider that every agent and every orchestrator uses unchanged: tier routing, ordered failover, circuit breaker, per-route timeout and rate limiter, scoped semantic cache, per-tenant budgets, audit, an OpenTelemetry span per request, fault injection | `gateway/` |
+| Guardrails | PII redaction (Luhn-checked cards), prompt-injection screening, output checks (including a company-domain allowlist); fail closed | `guardrails/` |
+| Support-ticket platform | Guard, triage, resolver (MCP tools), responder, guard; one `Workflow` that runs on five interchangeable coordinators; outcomes are released, held or escalated, and it never raises | `tickets/` |
+| Knowledge assistant | Access-filtered retrieval, cited answers, a check that every citation was retrieved for that user, hold-or-label policy on the degraded tier | `knowledge/` |
+| Identity | Short-lived, audience-bound, signed tokens, and token exchange where delegated access can only shrink (lab-grade; production uses OIDC / OAuth 2.1) | `identity/` |
+| Agent-to-agent | The ticket platform's resolver calls the knowledge assistant over ADK's A2A support, with bearer auth, a declared agent card security scheme, correlation id and W3C `traceparent` | `a2a_layer/` |
+| Monitoring | Quality, security and operations metrics checked against a deliberately saved baseline | `monitoring/` |
+| Decisions | Ten decision records, each tied to something measured here | `docs/decisions.md` |
+
+### How Requisite and ADK are used
+
+| Need | Used from |
 |---|---|
-| `provider.py` | `GatewayProvider`: tier routing, ordered failover, budget check, cache, audit, OpenTelemetry span per request, sync/async/stream, `preflight()` |
-| `routing.py` | `Route`, tier classifier, fallback order (same tier, then escalate, then degrade, local model last) |
-| `resilience.py` | `CircuitBreaker` (closed / open / half-open, injectable clock) |
-| `cache.py` | `SemanticCache`: exact hash lookup, then embedding similarity; entries are scoped by tenant and system prompt |
-| `audit.py` | One `AuditRecord` per request; prompts are hashed, not stored, unless you opt in |
-| (rate limits) | a Requisite `RateLimiter` is attached to each `Route` and acquired before the timed call, so queueing for quota is never counted as the provider being slow; routes sharing an API key share one limiter |
-| `faults.py` | `FaultInjector`: switch an outage on or off in front of a real provider |
-| `factory.py` | Standard build: Gemini light + heavy (Requisite `GeminiProvider`), local Ollama (Requisite `OllamaProvider`), Requisite `GeminiEmbeddingProvider` for the cache, Requisite `CostLimiter` for the budget |
+| Model providers, embeddings, cost per token | Requisite `GeminiProvider`, `OllamaProvider`, `GeminiEmbeddingProvider` |
+| Agents and multi-agent workflow | Requisite `Agent` and `Workflow`; coordinator switchable between Requisite native, Google ADK, OpenAI Agents SDK, Strands and Microsoft Agent Framework |
+| Tools | Requisite `MCPServer` and `MCPClient` (persistent agent-owned session) |
+| Retrieval | Requisite `HybridRetriever` with metadata filters (`{"groups": {"$in": [...]}}`), `InMemoryVectorStore` |
+| Per-request identity | Requisite `RequestContext` (tenant, operator and correlation id reach the gateway and tools without wrappers) |
+| Limits | Requisite `RateLimiter` and `CostLimiter` |
+| Tracing | Requisite and ADK GenAI span attributes, one OpenTelemetry trace across services |
+| Agent-to-agent | Google ADK `to_a2a`, `RemoteA2aAgent`, `AgentCardBuilder` |
 
-Reused from Requisite as-is: providers, embeddings, `RateLimiter`, `CostLimiter`, `cost_per_token`, `get_tracer`, `Message`/`ChatResponse`/`Usage`.
-
-## Run it
+## Quick start
 
 ```bash
 python -m venv venv && venv/Scripts/pip install -r requirements.txt
 cp .env.example .env            # add GEMINI_API_KEY
-ollama pull llama3.2:1b         # the degraded-tier route
-venv/Scripts/python -m pytest tests_offline -q     # 23 offline tests, no network
-venv/Scripts/python -u run_gateway_demo.py         # real run, 6 scenarios
+ollama pull llama3.2:1b         # the degraded-tier model
+venv/Scripts/python -m pytest tests_offline -q      # 102 offline tests, no network, no API key
 ```
 
-## What the real run showed
+Prices in `gateway/factory.py` are the published Gemini API paid-tier prices read on 2026-10-03; they are configuration and will change.
 
-- **Routing:** short tickets served by `gemini-3.5-flash-lite`; a 744-token prompt routed to `gemini-3.5-flash` at about 58x the cost of a light call.
-- **Cache:** an exact repeat cost 0 ms and 0 tokens. A paraphrase hit at similarity 0.987. A *different* request ("cancel both charges **and close the account**") also hit at 0.946 and was answered with the refund answer. A similarity threshold is a correctness setting, not just a cost setting.
-- **Tenant isolation:** the same ticket from two tenants produced two model calls; only a repeat from the same tenant hit the cache.
-- **Failover (injected outage):** light down escalated to heavy at roughly 40x the per-request cost; the breaker opened after 3 failures and later requests skipped the dead route with no timeout; with both Gemini routes down the local model answered; after the cool-down a probe closed the breaker.
-- **Budget:** the reactive limiter lets one call cross the cap, then blocks every later call.
-- **Preflight:** a fallback route that has never run is untested; `preflight(probe=True)` exercises every route before an outage needs it.
+## Run it
 
-Outage numbers come from a `FaultInjector` in front of real providers (an injected fault, not a real vendor outage).
-
-## Not in Phase 1
-
-Per-tenant budgets, guardrails, MCP tools, RAG, A2A and the ADK orchestration arrive in later phases.
-
-Prices in `factory.py` are the published Gemini API paid-tier prices read on 2026-10-03; they are configuration and will change.
-
----
-
-## Phase 2: the support-ticket platform (`tickets/`, `guardrails/`)
-
-```
-ticket -> input guard -> triage -> resolver (MCP tools) -> responder -> output guard -> released | held | escalated
-```
-
-| Piece | Built with |
+| Script | What it does |
 |---|---|
-| Three agents (triage, resolver, responder) | Requisite `Agent` on the shared gateway; tenant and correlation id travel in Requisite's `RequestContext` |
-| Orchestration, switchable | Requisite `Workflow` on **Google ADK** (`use_adk()`) or the native engine (`use_native()`) |
-| Tools | Requisite `MCPServer` (3 read-only tools, stdio) consumed by Requisite `MCPClient` |
-| Guardrails | `guardrails/`: PII redaction (Luhn-checked cards), injection screening, output validation; fail-closed policy |
-| Tracing | OpenTelemetry: ADK spans, Requisite `agent`/`ai` spans (GenAI attributes from Requisite 0.39.0) and the gateway span nest in one trace |
-| Per-tenant budgets, sticky tool loops, degraded-tier hold | `gateway/provider.py`, `tickets/platform.py` |
+| `run_gateway_demo.py` | Six gateway scenarios on real models: routing, cache, tenant isolation, injected outage and failover, budget, preflight |
+| `run_ticket_eval.py` | The ticket platform on nine labelled tickets. `--backend adk,native,openai_agents,strands,agent_framework` compares coordinators; `--pin-light` fixes the model |
+| `run_knowledge_eval.py` | 13 questions, 5 users: access control on, access control off (control), cache-scope experiment |
+| `run_a2a_demo.py` | Two services over A2A: delegation, four attacks on the endpoint, confused deputy, one trace |
+| `run_drift_demo.py` | Baseline, repeat, injected outage, dropped access filter, each checked against the baseline |
+| `run_failure_study.py` | Seven injected failures against the real pipelines |
+| `run_finops.py` | Measured cost per path, a live cache experiment, and projections labelled as assumptions |
 
-```bash
-venv/Scripts/python -m pytest tests_offline -q                        # 46 offline tests
-venv/Scripts/python -u run_ticket_eval.py --pin-light --show          # both backends, same model, 9 labelled tickets
-```
+Everything runs on the Gemini free tier plus a local 1B model, on synthetic data (customers, orders, a 14-document knowledge base, 9 tickets, 13 questions). Outages are switched on by a `FaultInjector` in front of real providers; they are injected faults, not vendor outages. Dollar figures are the same tokens priced at the published paid rates.
 
-### What the real runs showed (Gemini free tier, `gemini-3.5-flash-lite`, 9 synthetic tickets)
+## What the runs showed
 
-- **Both orchestrators reach the same results.** ADK and native: category 7/7, severity 4/7 (the same three severity calls differ from my labels on both), expected facts present 93% (ADK) and 100% (native) on 7 tickets. With n=7 that difference is noise, not a finding. Median latency was dominated by per-call MCP process start-up, not by the orchestrator.
-- **Guardrails:** both injection tickets were escalated with **zero model or tool calls**; the PII ticket reached the model with the email, phone and card replaced by `[EMAIL]`, `[PHONE]`, `[CARD]` and was still resolved correctly.
-- **Output guard needs an allowlist.** A reply quoting the company's own `no-reply@` address was held as "PII" until the guard learned the company domain.
-- **Silent failover hides a quota problem.** In the tiered run the heavy model (`gemini-3.5-flash`) returned `429` (free-tier limit: 20 requests per day) and the gateway quietly served those calls from the light model. Availability held; the only trace was the audit log.
-- **Failover keeps the system up, not the answers good.** A second backend run built its own rate limiter, together exceeded the real quota, tripped both Gemini breakers, and 22 of 28 calls were answered by the local 1B model: category accuracy fell to 4/7 and expected facts to 36%, yet **the guardrails released all seven replies** (they check for leaks, not correctness). The platform now holds any ticket served by the degraded tier. Share one `RateLimiter` per API key.
-- **Mid-tool-loop failover breaks tool calling.** One request failed with `400: Function call is missing a thought_signature` after a route change inside a tool loop; the gateway now pins a tool loop to the route that started it (verified offline with scripted fakes; the live failure was seen once).
-- **MCP over stdio reconnects on every tool call**, and `initialize` dominated each call (about 5.9 s of 6.4 s in one trace, 2.0 s of 2.3 s in another).
-- **ADK's per-agent token counters read empty** (`in=None out=None`) because Requisite's ADK shim does not pass usage back to ADK.
+### Gateway
 
-Cost figures are computed from published paid-tier prices; the runs themselves used the free tier.
+- **Routing.** Short tickets were served by `gemini-3.5-flash-lite`; a 744-token prompt routed to `gemini-3.5-flash` at about 58x the cost of a light call.
+- **Cache.** An exact repeat cost 0 ms and 0 tokens. A paraphrase hit at similarity 0.987. A different request ("cancel both charges **and close the account**") also hit at 0.946 and got the refund answer, so the similarity threshold is a correctness setting, not just a cost setting. The same ticket from two tenants produced two model calls.
+- **Failover.** With the light route down, requests escalated to the heavy model at roughly 40x the per-request cost; the breaker opened after 3 failures and later requests skipped the dead route with no timeout; with both Gemini routes down the local model answered; after the cool-down a probe closed the breaker.
+- **Budget.** The reactive limiter lets one call cross the cap, then blocks every later call. Budgets are per tenant.
+- **Degraded tier.** Failover keeps the system up, not the answers good. With the local 1B model answering, category accuracy fell from 7/7 to 4/7 and expected facts from 93 percent to 36 percent, yet the guardrails released every reply, because they check for leaks, not correctness. The platform therefore holds any ticket served by the degraded tier, and the knowledge assistant holds or labels such answers by policy.
+- **Tool loops are sticky.** A tool loop stays on the route that started it, because switching provider mid-conversation breaks tool calling.
+- **Preflight.** A fallback route that has never run is untested; `preflight(probe=True)` exercises every route before an outage needs it.
 
+### Support-ticket platform
 
----
+- **Guardrails.** Both injection tickets were escalated with zero model or tool calls; the PII ticket reached the model with the email, phone and card replaced by `[EMAIL]`, `[PHONE]`, `[CARD]` and was still resolved correctly.
+- **Five coordinators, one result.** The same nine tickets on Google ADK, Requisite native, OpenAI Agents SDK, Strands and Microsoft Agent Framework: category 7/7 and severity 4/7 on every one, all 28 model calls through the gateway to the same model. The coordinators used 7,829 to 10,362 input tokens for the same work (a 32 percent spread, 14 percent in dollars). Latency is not comparable across them because the shared 15-requests-per-minute limiter dominates.
+- **Persistent MCP session.** With the resolver owning its MCP session, its three tool calls took 3 to 4 ms each after one 974 ms initialize, instead of about 6.4 s each when every call started a new server process.
 
-## Phase 3: the enterprise knowledge assistant (`knowledge/`)
+### Knowledge assistant
 
-```
-question -> input guard -> ACL-filtered retrieval -> answer agent -> citation check -> output guard -> answered | not_found | held | escalated
-```
+- **Access control on: 13/13 correct, 0 of 5 restricted documents leaked.** The five questions a user was not allowed to see returned "I can't find that in the documents you have access to"; the unanswerable question did too; the injection attempt was escalated with no model call.
+- **Access control off (control): 8/13 correct, 5 of 5 leaked.** Same model, same questions, retrieval ignoring groups. The citation check passed all five leaks, because it verifies that an answer is grounded in what was retrieved, not that retrieval was authorized. Grounding checks and authorization are different controls.
+- **The model never receives unauthorized text**, asserted offline by capturing the exact prompt for every question. A leak is measured with canary facts that appear in one restricted document and nowhere else.
+- **Cache scope.** Keep the access fingerprint in the cache scope. With a permissive threshold and an organization-only scope, one user's answer is served to another; in that case the citation check held it, but that is a second line of defence, not the design.
 
-| Piece | Built with |
-|---|---|
-| Embeddings, vector store, chunking | Requisite `GeminiEmbeddingProvider` (`gemini-embedding-2`), `InMemoryVectorStore`, `Retriever.add_texts` |
-| Access control | `knowledge/index.py`: one boolean flag per allowed group on every chunk, one **pre-filtered** store search per group the user belongs to, merged. No groups means no results |
-| Answer agent | Requisite `Agent` on the shared gateway, provider pinned to the user's *access fingerprint* so the cache never crosses access levels |
-| Checks | Every answer must cite sources, every citation must be a chunk retrieved for that user, plus the Phase 2 input and output guards |
+### Identity and agent-to-agent
 
-Authorization is enforced in code at retrieval, never by asking the model to behave. A leak is measured, not judged: each restricted document carries a canary fact that appears nowhere else.
+- **The callee enforces identity.** The knowledge agent derives groups from a verified token, never from message text. Four attacks (no token, forged signature claiming `exec`, expired token, token for another audience) were rejected with `401`, each audited, and the knowledge service made zero model calls.
+- **Delegation shrinks access.** An executive calling the knowledge agent directly got the confidential acquisition answer; the same executive acting through the ticket agent got "I can't find that", because the exchanged token's groups are the user's groups intersected with the ticket agent's own ceiling.
+- **The audit trail is the evidence.** With the support operator the resolver's A2A call cited the refund policy (audit: groups `employee,support`); with an engineer it got "not found" (audit: groups `employee`). Reply wording varies because the model summarises; the audit does not.
+- **One trace across the HTTP hop.** The ticket workflow, the ADK agents, the resolver's tool call, the A2A client and server spans, the knowledge call and the gateway span share one trace id.
+- **The agent card declares its auth.** ADK's automatic card has no security scheme, so a client cannot discover that a bearer token is required; the lab builds the card with `AgentCardBuilder(security_schemes=...)`.
 
-```bash
-venv/Scripts/python -m pytest tests_offline -q          # 68 offline tests
-venv/Scripts/python -u run_knowledge_eval.py            # real run: ACL on, ACL off (control), cache-scope experiment
-```
+### Drift, failures and cost
 
-### What the real run showed (12 synthetic documents, 5 users, 13 questions, `gemini-3.5-flash-lite`)
-
-- **Access control ON: 13/13 correct, 0/5 restricted documents leaked.** All six authorized questions were answered with the right citation and exact facts; the five questions a user was not allowed to see returned "I can't find that in the documents you have access to"; the unanswerable question did too; the injection attempt was escalated with no model call.
-- **Access control OFF (control): 8/13 correct, 5/5 restricted documents leaked.** Same model, same questions, retrieval ignoring groups: the model answered every one of them, with a valid citation. The **citation check passed all five leaks**, because it verifies that an answer is grounded in what was retrieved, not that retrieval was authorized. Grounding checks and authorization are different controls.
-- **The model never receives unauthorized text** (asserted offline by capturing the exact prompt for every question).
-- **Cache scope:** with an access-fingerprint scope and with an organization-only scope, the second user was not served the first user's answer at similarity threshold 0.90, because the cache keys on the whole prompt, sources included, and the two users' sources differed. That is an accident of protection, not a guarantee. Offline, a permissive threshold (0.5) under an organization-only scope *does* serve one user's answer to another; there the citation check held the answer because it cited a document the second user was never shown. Keep the access fingerprint in the scope.
-- **Limits of this run:** 12 documents of one chunk each, so it exercises authorization and citation mechanics, not retrieval quality at scale.
-
-### Requisite 0.40.0 adopted (agent-owned persistent MCP sessions, ADK token usage)
-
-On the same 9 tickets and model as Phase 2, the resolver's three MCP tool calls dropped from **about 6.4 s each (initialize dominated) to 3 to 4 ms each**, with one 974 ms `initialize` per agent, and ADK's per-agent token counts are now populated (`in=1174 out=182` instead of `None`). End-to-end ticket latency still shows 37 to 46 s outliers: each is a single model call that includes waiting on the shared 15-requests-per-minute rate limiter, which this run did not instrument separately, so no orchestrator or MCP conclusion is drawn from them.
-
-
----
-
-## Phase 4: two agents, one identity, one trace (`a2a_layer/`, `identity/`, `monitoring/`)
-
-```
-operator --login--> ticket platform (ADK + Requisite) --A2A over HTTP--> knowledge agent (ADK to_a2a + Requisite)
-```
-
-| Piece | Built with |
-|---|---|
-| A2A server and client | Google ADK: `to_a2a` (server, agent card) and `RemoteA2aAgent` + `InMemoryRunner` (client), on a2a-sdk 1.2.1 |
-| Agent logic on both sides | Requisite: the ticket `Workflow` on the ADK orchestrator, and `KnowledgeAssistant`, wrapped in a thin ADK `BaseAgent` |
-| Resolver to knowledge agent | an async Requisite `@tool` (`tickets/policy_tool.py`) that calls the remote agent as the operator handling the ticket |
-| Identity | `identity/tokens.py`: short-lived, audience-bound, signed tokens and token exchange. Lab-grade; production uses OAuth 2.1 / OIDC and the card's declared security schemes |
-| Audit and tracing | correlation id and W3C `traceparent` carried as HTTP headers, per-service audit records, one OpenTelemetry trace across both services |
-| Drift | `monitoring/drift.py`: quality, security and operations metrics against a deliberately saved baseline |
-
-```bash
-venv/Scripts/python -m pytest tests_offline -q        # 96 offline tests (A2A tests use real HTTP on localhost, a scripted model)
-venv/Scripts/python -u run_a2a_demo.py                # real run: delegation, attacks, confused deputy, one trace
-venv/Scripts/python -u run_drift_demo.py              # real run: baseline, repeat, injected outage, dropped access filter
-```
-
-### What the real runs showed
-
-- **The callee enforces identity, not the caller.** The knowledge agent derives the caller's groups from a verified token, never from message text. Four attacks on the endpoint (no token, forged signature claiming `exec`, expired token, token for another audience) were rejected with `401`, each recorded in the audit trail, and **the knowledge service made zero model calls** while they happened.
-- **Delegation shrinks access.** An executive calling the knowledge agent directly got the confidential acquisition answer; the same executive acting through the ticket agent got "I can't find that", because the exchanged token's groups are the user's groups intersected with the ticket agent's own ceiling. A service can never lend more access than it holds.
-- **The support-only policy reached only the right operator.** Same ticket, same resolver: the support operator's A2A call was answered with a citation to the refund policy (audit: groups `employee,support`, cited `SUP-001`); the engineer's call was answered "not found" (audit: groups `employee`). The audit trail, not the reply text, is the evidence: across two full runs the support operator's reply quoted the 500-dollar approval threshold once and left it out once, because the model summarises.
-- **One trace across the HTTP hop.** `ticket.handle`, the ADK agents, the resolver's `ask_policy` tool call, the A2A client and server spans, `knowledge.ask` and the knowledge service's `gateway.chat` share one trace id.
-- **The agent card must declare its auth.** ADK's automatic card has no security scheme, so a client cannot discover that a bearer token is required; the lab builds the card with `AgentCardBuilder(security_schemes=...)`.
-- **Drift: three different failure shapes, one monitor.** Against a saved baseline (13/13 correct, 0 leaks, no fallbacks), an unchanged repeat read **stable** (model noise tolerated). An injected outage (Gemini routes down, the local 1B model answering everything) read **critical** on `correct_rate` (1.00 to 0.62) and `degraded_share` (0 to 1); the small model still answered all six authorized questions correctly but ignored the refusal rule, filling denied and unknown questions with irrelevant or invented text carrying valid citations that the citation check cannot judge. Dropping the access filter read **critical** on `leaks` (0 to 5) while latency and cost barely moved. During the outage **cost per request fell to zero**: a cost dashboard looks healthier exactly when the system is degraded.
-- **Detector limit, honestly stated.** In an earlier run of the outage condition the monitor flagged one leak that did not reproduce. Per-case answers were not saved in that run, so it cannot be classified; later runs save every answer, and the outage run's answers contained no restricted content.
-
-Limits: tokens are HMAC-signed with a shared secret and live in one process; the operator's credential is kept in a service-side store keyed by correlation id, so concurrent tickets are isolated (Requisite 0.42.0 request context); everything runs on the Gemini free tier and a local 1B model with 12 documents and 9 to 13 questions, so it demonstrates mechanisms, not scale.
-
-
----
-
-## Phase 5: failure modes, cost, and which coordinator (`run_failure_study.py`, `run_finops.py`, `docs/decisions.md`)
-
-```bash
-venv/Scripts/python -u run_failure_study.py                                   # 7 injected failures against the real pipelines
-venv/Scripts/python -u run_finops.py                                          # measured cost per path, live cache experiment, projections
-venv/Scripts/python -u run_ticket_eval.py --backend adk,native,openai_agents,strands,agent_framework --pin-light
-```
-
-Built in this phase: per-route timeouts (the rate-limiter wait is outside the timed call), a per-route rate limiter, hold-or-label policy for the degraded tier on the knowledge path, held outcomes for failed required tools, retrieval and budget failures that end in a defined outcome instead of an exception, and the adoption of Requisite 0.42.0's request-scoped context (the tenant wrapper and the single-operator limit are gone). Ten decision records are in [`docs/decisions.md`](docs/decisions.md).
-
-### What the real runs showed
-
+- **Drift: three failure shapes, one monitor.** Against a saved baseline (13/13 correct, 0 leaks, no fallbacks) an unchanged repeat read **stable**. An injected outage read **critical** on `correct_rate` (1.00 to 0.62) and `degraded_share` (0 to 1): the small model answered the authorized questions but ignored the refusal rule, filling denied and unknown questions with invented text carrying valid citations. Dropping the access filter read **critical** on `leaks` (0 to 5) while latency and cost barely moved. During the outage cost per request fell to zero: a cost dashboard looks healthier exactly when the system is degraded.
 - **Seven injected failures, seven defined outcomes, no restricted fact in any answer.** Light route down: escalated to the heavy model. All cloud routes down: the local model answered and the answer was held (or labelled, by policy). Embedding API down: failed closed with no model call. MCP server will not start: ticket held. Knowledge agent unreachable: ticket held because a requested fact was missing, no policy invented. Budget exhausted: held, nothing crashed.
 - **A shorter timeout can make the common case slower.** With an 8 s injected delay, no timeout answered in 9.7 s; with a 2 s timeout the request moved to the heavy model and answered in 17.0 s and 15.6 s in two runs, and fell through to the local model (held) in a third.
-- **Five coordinators, one result.** The same nine tickets on Google ADK, Requisite native, OpenAI Agents SDK, Strands and Microsoft Agent Framework: category 7/7 and severity 4/7 on every one, the same category on every ticket, all 28 model calls on every one through the gateway to the same Gemini model. The coordinators used 7,829 to 10,362 input tokens for the same work (a 32 percent spread, 14 percent in dollars). Latency is not comparable: the shared 15 requests per minute limiter works out to about 16 s per ticket, which four of the five measured.
 - **Measured unit costs** at published paid-tier prices: a ticket (4 model calls) $0.001104 on flash-lite and $0.004598 if every call ran on the heavy model; a knowledge answer $0.000167 and $0.000767.
 - **Cache experiment** on a deliberately repetitive 22-question workload: 22 model calls and $0.004065 with the cache off, 6 calls and $0.001116 with it on (threshold 0.90, scoped by access), mean latency 3.17 s to 1.12 s, zero wrong answers in both. The 73 percent hit rate belongs to that workload, and the cache's own embedding calls are not counted.
-- **Projections** (monthly cost at assumed volumes, and break-even against an assumed hosting cost) are arithmetic on those measurements, labelled as assumptions in the output.
+- **Projections** (monthly cost at assumed volumes, break-even against an assumed hosting cost) are arithmetic on those measurements and are labelled as assumptions in the output.
 
-Everything ran on the Gemini free tier, so dollar figures are the same tokens priced at the published paid rates. Injected failures are switched on in front of real providers and are not vendor outages.
+## Limits
+
+- Tokens are HMAC-signed with a shared secret and live in one process; production uses an OIDC / OAuth 2.1 identity provider and the security schemes the agent card declares.
+- The operator's credential sits in a service-side store keyed by correlation id, so concurrent tickets for different operators are isolated.
+- Fourteen short documents and 9 to 13 questions demonstrate mechanisms, not retrieval quality or throughput at scale. With 7 to 9 cases, small differences between runs are noise.
+- The gateway is an in-process policy engine, not a network service. A shared multi-tenant gateway (virtual keys, team quotas, dashboards) belongs at the deployment tier; `docs/decisions.md` covers when to buy one.
+- Synthetic data only.
+
+## Layout
+
+```
+gateway/        routing, circuit breaker, semantic cache, audit, fault injection, factory
+guardrails/     PII redaction, injection screen, output checks, fail-closed policy
+tickets/        support-ticket platform, MCP tool server, policy tool
+knowledge/      corpus, access-filtered index, assistant
+identity/       tokens, login, token exchange
+a2a_layer/      A2A server (auth middleware, agent card) and client
+monitoring/     drift rules, baseline, checks
+docs/           decision records
+tests_offline/  102 tests, scripted models, no network
+audit/          audit logs and per-case outcomes from the real runs
+baselines/      the saved drift baseline
+```

@@ -1,4 +1,4 @@
-"""Phase 3 live run: the enterprise knowledge assistant on real models.
+"""Live run: the enterprise knowledge assistant on real models.
 
 Conditions:
   A. access control ON  (the design)

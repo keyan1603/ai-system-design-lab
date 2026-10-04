@@ -4,7 +4,7 @@
 
 * The three agents are plain Requisite `Agent`s sharing one `Workflow`. Who a
   run is for (operator, tenant, correlation id) travels in Requisite's
-  `RequestContext` (0.42.0), so the gateway reads the tenant itself, tools see
+  `RequestContext`, so the gateway reads the tenant itself, tools see
   the operator, and concurrent tickets for different operators stay isolated.
 * The same `Workflow` runs on Requisite's native engine or on Google ADK,
   OpenAI Agents, Strands or Microsoft Agent Framework; only the coordinator
@@ -106,7 +106,7 @@ class TicketPlatform:
         if self._workflow is None:
             wf = Workflow()
             wf.add(Agent(name="triage", provider=self.gateway, system_prompt=TRIAGE_PROMPT, max_iterations=1))
-            # The resolver owns its MCP session (Requisite 0.40.0): one server process, reused for every call.
+            # The resolver owns its MCP session (Requisite persistent MCP sessions): one server process, reused for every call.
             mcp = MCPClient.stdio(name="ticket-ops", command=self._mcp_command[0], args=self._mcp_command[1:])
             prompt = RESOLVER_PROMPT + (POLICY_ADDENDUM if self.policy_tool else "")
             extra = [self.policy_tool.as_tool()] if self.policy_tool else []

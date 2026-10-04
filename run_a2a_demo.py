@@ -1,4 +1,4 @@
-"""Phase 4 live run: two agents, two services, one verified identity, one trace.
+"""Live run: two agents, two services, one verified identity, one trace.
 
     operator --login--> ticket platform (ADK + Requisite) --A2A over HTTP--> knowledge agent (ADK to_a2a + Requisite)
 
