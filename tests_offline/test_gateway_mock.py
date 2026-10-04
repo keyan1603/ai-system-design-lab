@@ -273,9 +273,11 @@ def test_span_carries_genai_and_gateway_attributes():
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
     exporter = InMemorySpanExporter()
-    tp = TracerProvider()
+    tp = trace.get_tracer_provider()
+    if not hasattr(tp, "add_span_processor"):       # the global provider can be installed only once per process
+        tp = TracerProvider()
+        trace.set_tracer_provider(tp)
     tp.add_span_processor(SimpleSpanProcessor(exporter))
-    trace.set_tracer_provider(tp)
     GatewayProvider([route("l", LIGHT)]).chat(user("hi"), tenant="t1")
     spans = [s for s in exporter.get_finished_spans() if s.name == "gateway.chat"]
     assert spans, "gateway.chat span was not exported"

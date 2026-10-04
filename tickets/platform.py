@@ -45,6 +45,11 @@ RESOLVER_PROMPT = (
     "Never guess. Reply with a short resolution note that restates the ticket in one sentence, then lists the facts "
     "you looked up using their exact values (for example a billing status or a number of minutes)."
 )
+POLICY_ADDENDUM = (
+    " For company policy questions (refund rules, approval limits, escalation paths) call ask_policy with one specific "
+    "question and include its answer, with its source ids in square brackets, in your note. If ask_policy says the "
+    "lookup was not permitted, say so plainly and do not guess the policy."
+)
 RESPONDER_PROMPT = (
     "You write the customer-facing reply for a support ticket from a resolution note. Be brief and polite (3 sentences). "
     "Use only facts that appear in the note, quote exact values, and never mention any customer or order id that is not in the note."
@@ -66,7 +71,8 @@ class Outcome:
 
 
 class TicketPlatform:
-    def __init__(self, gateway: GatewayProvider, backend: str = "adk", policy: Optional[GuardrailPolicy] = None):
+    def __init__(self, gateway: GatewayProvider, backend: str = "adk", policy: Optional[GuardrailPolicy] = None,
+                 policy_tool=None):
         if backend not in ("adk", "native"):
             raise ValueError("backend must be 'adk' or 'native'")
         self.gateway, self.backend = gateway, backend
@@ -74,6 +80,8 @@ class TicketPlatform:
         self.policy = policy or GuardrailPolicy(allowed_email_domains=frozenset({"example.com"}))
         self._workflows: dict[str, Workflow] = {}
         self._resolvers: list[Agent] = []
+        # Optional A2A link to the knowledge agent (tickets.policy_tool.PolicyTool).
+        self.policy_tool = policy_tool
 
     def close(self) -> None:
         """Close every resolver agent, which closes the MCP sessions it owns."""
@@ -98,7 +106,9 @@ class TicketPlatform:
             # instead of spawning and initializing a server per tool call. One
             # client per tenant workflow, because a client holds one session.
             mcp = MCPClient.stdio(name="ticket-ops", command=sys.executable, args=["-m", "tickets.mcp_server"])
-            resolver = Agent(name="resolver", provider=provider, system_prompt=RESOLVER_PROMPT, mcp_clients=[mcp], max_iterations=6)
+            prompt = RESOLVER_PROMPT + (POLICY_ADDENDUM if self.policy_tool else "")
+            extra = [self.policy_tool.as_tool()] if self.policy_tool else []
+            resolver = Agent(name="resolver", provider=provider, system_prompt=prompt, tools=extra, mcp_clients=[mcp], max_iterations=6)
             self._resolvers.append(resolver)
             wf.add(resolver)
             wf.add(Agent(name="responder", provider=provider, system_prompt=RESPONDER_PROMPT, max_iterations=1))
@@ -106,12 +116,15 @@ class TicketPlatform:
             self._workflows[tenant] = wf
         return self._workflows[tenant]
 
-    def handle(self, ticket: Ticket) -> Outcome:
+    def handle(self, ticket: Ticket, operator_token: Optional[str] = None, correlation_id: str = "") -> Outcome:
         t0 = time.perf_counter()
+        if self.policy_tool:
+            self.policy_tool.set_operator(operator_token, correlation_id)
         with _tracer.start_as_current_span("ticket.handle") as span:
             span.set_attribute("ticket.id", ticket.id)
             span.set_attribute("ticket.tenant", ticket.tenant)
             span.set_attribute("ticket.backend", self.backend)
+            span.set_attribute("ticket.correlation_id", correlation_id)
 
             decision = self.policy.check_input(ticket.text)
             span.set_attribute("guardrail.input_action", decision.action)

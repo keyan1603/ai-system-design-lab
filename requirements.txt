@@ -1,4 +1,4 @@
-requisite-ai[gemini,adk,otel,mcp,rag,ollama]>=0.40.0  # 0.39.0 adds the gen_ai span attributes the gateway reuses (unreleased on PyPI as of 2026-10-03: install from source with pip install -e)
+requisite-ai[gemini,adk,otel,mcp,rag,ollama]>=0.41.0  # 0.39.0 adds the gen_ai span attributes the gateway reuses (unreleased on PyPI as of 2026-10-03: install from source with pip install -e)
 python-dotenv
 tabulate
 pytest

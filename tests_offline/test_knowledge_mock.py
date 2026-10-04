@@ -117,6 +117,21 @@ def test_union_across_groups_recovers_documents_from_each_group(index):
     assert {"EXEC-001", "LEG-001", "HR-003"} <= hits       # three different docs, all via the exec flag
 
 
+def test_keyword_path_cannot_return_restricted_documents(index):
+    # A query made of a restricted document's exact words would win on the keyword
+    # side of the hybrid retriever; for an unauthorized user it must still return nothing from it.
+    hits = ids(index.search(USERS["dave"], "deployctl rollback --to-previous severity incident", top_k=12))
+    assert "ENG-001" not in hits
+    assert "ENG-001" in ids(index.search(USERS["alice"], "deployctl rollback --to-previous severity incident", top_k=12))
+
+
+def test_dense_only_index_enforces_the_same_rule():
+    idx = SecureIndex(BowEmbedder(), hybrid=False)
+    idx.ingest(DOCS)
+    assert "FIN-001" not in ids(idx.search(USERS["alice"], "Q3 revenue forecast", top_k=12))
+    assert idx.search(User("ghost", "acme", ()), "revenue forecast", top_k=5) == []
+
+
 # ---- the model never receives unauthorized text --------------------------------------
 @pytest.mark.parametrize("case", [c for c in CASES if c.expect in ("answer", "denied")], ids=lambda c: c.id)
 def test_prompt_contains_canary_only_for_authorized_users(index, case):

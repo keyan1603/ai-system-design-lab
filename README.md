@@ -117,3 +117,39 @@ venv/Scripts/python -u run_knowledge_eval.py            # real run: ACL on, ACL 
 ### Requisite 0.40.0 adopted (agent-owned persistent MCP sessions, ADK token usage)
 
 On the same 9 tickets and model as Phase 2, the resolver's three MCP tool calls dropped from **about 6.4 s each (initialize dominated) to 3 to 4 ms each**, with one 974 ms `initialize` per agent, and ADK's per-agent token counts are now populated (`in=1174 out=182` instead of `None`). End-to-end ticket latency still shows 37 to 46 s outliers: each is a single model call that includes waiting on the shared 15-requests-per-minute rate limiter, which this run did not instrument separately, so no orchestrator or MCP conclusion is drawn from them.
+
+
+---
+
+## Phase 4: two agents, one identity, one trace (`a2a_layer/`, `identity/`, `monitoring/`)
+
+```
+operator --login--> ticket platform (ADK + Requisite) --A2A over HTTP--> knowledge agent (ADK to_a2a + Requisite)
+```
+
+| Piece | Built with |
+|---|---|
+| A2A server and client | Google ADK: `to_a2a` (server, agent card) and `RemoteA2aAgent` + `InMemoryRunner` (client), on a2a-sdk 1.2.1 |
+| Agent logic on both sides | Requisite: the ticket `Workflow` on the ADK orchestrator, and `KnowledgeAssistant`, wrapped in a thin ADK `BaseAgent` |
+| Resolver to knowledge agent | an async Requisite `@tool` (`tickets/policy_tool.py`) that calls the remote agent as the operator handling the ticket |
+| Identity | `identity/tokens.py`: short-lived, audience-bound, signed tokens and token exchange. Lab-grade; production uses OAuth 2.1 / OIDC and the card's declared security schemes |
+| Audit and tracing | correlation id and W3C `traceparent` carried as HTTP headers, per-service audit records, one OpenTelemetry trace across both services |
+| Drift | `monitoring/drift.py`: quality, security and operations metrics against a deliberately saved baseline |
+
+```bash
+venv/Scripts/python -m pytest tests_offline -q        # 96 offline tests (A2A tests use real HTTP on localhost, a scripted model)
+venv/Scripts/python -u run_a2a_demo.py                # real run: delegation, attacks, confused deputy, one trace
+venv/Scripts/python -u run_drift_demo.py              # real run: baseline, repeat, injected outage, dropped access filter
+```
+
+### What the real runs showed
+
+- **The callee enforces identity, not the caller.** The knowledge agent derives the caller's groups from a verified token, never from message text. Four attacks on the endpoint (no token, forged signature claiming `exec`, expired token, token for another audience) were rejected with `401`, each recorded in the audit trail, and **the knowledge service made zero model calls** while they happened.
+- **Delegation shrinks access.** An executive calling the knowledge agent directly got the confidential acquisition answer; the same executive acting through the ticket agent got "I can't find that", because the exchanged token's groups are the user's groups intersected with the ticket agent's own ceiling. A service can never lend more access than it holds.
+- **The support-only policy reached only the right operator.** Same ticket, same resolver: the support operator's A2A call was answered with a citation to the refund policy (audit: groups `employee,support`, cited `SUP-001`); the engineer's call was answered "not found" (audit: groups `employee`). The audit trail, not the reply text, is the evidence: across two full runs the support operator's reply quoted the 500-dollar approval threshold once and left it out once, because the model summarises.
+- **One trace across the HTTP hop.** `ticket.handle`, the ADK agents, the resolver's `ask_policy` tool call, the A2A client and server spans, `knowledge.ask` and the knowledge service's `gateway.chat` share one trace id.
+- **The agent card must declare its auth.** ADK's automatic card has no security scheme, so a client cannot discover that a bearer token is required; the lab builds the card with `AgentCardBuilder(security_schemes=...)`.
+- **Drift: three different failure shapes, one monitor.** Against a saved baseline (13/13 correct, 0 leaks, no fallbacks), an unchanged repeat read **stable** (model noise tolerated). An injected outage (Gemini routes down, the local 1B model answering everything) read **critical** on `correct_rate` (1.00 to 0.62) and `degraded_share` (0 to 1); the small model still answered all six authorized questions correctly but ignored the refusal rule, filling denied and unknown questions with irrelevant or invented text carrying valid citations that the citation check cannot judge. Dropping the access filter read **critical** on `leaks` (0 to 5) while latency and cost barely moved. During the outage **cost per request fell to zero**: a cost dashboard looks healthier exactly when the system is degraded.
+- **Detector limit, honestly stated.** In an earlier run of the outage condition the monitor flagged one leak that did not reproduce. Per-case answers were not saved in that run, so it cannot be classified; later runs save every answer, and the outage run's answers contained no restricted content.
+
+Limits: tokens are HMAC-signed with a shared secret and live in one process; the ticket tool holds one operator at a time (tickets are handled sequentially); everything runs on the Gemini free tier and a local 1B model with 12 documents and 9 to 13 questions, so it demonstrates mechanisms, not scale.
