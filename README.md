@@ -58,7 +58,7 @@ ticket -> input guard -> triage -> resolver (MCP tools) -> responder -> output g
 
 | Piece | Built with |
 |---|---|
-| Three agents (triage, resolver, responder) | Requisite `Agent`, provider = `TenantProvider(gateway, tenant)` |
+| Three agents (triage, resolver, responder) | Requisite `Agent` on the shared gateway; tenant and correlation id travel in Requisite's `RequestContext` |
 | Orchestration, switchable | Requisite `Workflow` on **Google ADK** (`use_adk()`) or the native engine (`use_native()`) |
 | Tools | Requisite `MCPServer` (3 read-only tools, stdio) consumed by Requisite `MCPClient` |
 | Guardrails | `guardrails/`: PII redaction (Luhn-checked cards), injection screening, output validation; fail-closed policy |
@@ -152,4 +152,28 @@ venv/Scripts/python -u run_drift_demo.py              # real run: baseline, repe
 - **Drift: three different failure shapes, one monitor.** Against a saved baseline (13/13 correct, 0 leaks, no fallbacks), an unchanged repeat read **stable** (model noise tolerated). An injected outage (Gemini routes down, the local 1B model answering everything) read **critical** on `correct_rate` (1.00 to 0.62) and `degraded_share` (0 to 1); the small model still answered all six authorized questions correctly but ignored the refusal rule, filling denied and unknown questions with irrelevant or invented text carrying valid citations that the citation check cannot judge. Dropping the access filter read **critical** on `leaks` (0 to 5) while latency and cost barely moved. During the outage **cost per request fell to zero**: a cost dashboard looks healthier exactly when the system is degraded.
 - **Detector limit, honestly stated.** In an earlier run of the outage condition the monitor flagged one leak that did not reproduce. Per-case answers were not saved in that run, so it cannot be classified; later runs save every answer, and the outage run's answers contained no restricted content.
 
-Limits: tokens are HMAC-signed with a shared secret and live in one process; the ticket tool holds one operator at a time (tickets are handled sequentially); everything runs on the Gemini free tier and a local 1B model with 12 documents and 9 to 13 questions, so it demonstrates mechanisms, not scale.
+Limits: tokens are HMAC-signed with a shared secret and live in one process; the operator's credential is kept in a service-side store keyed by correlation id, so concurrent tickets are isolated (Requisite 0.42.0 request context); everything runs on the Gemini free tier and a local 1B model with 12 documents and 9 to 13 questions, so it demonstrates mechanisms, not scale.
+
+
+---
+
+## Phase 5: failure modes, cost, and which coordinator (`run_failure_study.py`, `run_finops.py`, `docs/decisions.md`)
+
+```bash
+venv/Scripts/python -u run_failure_study.py                                   # 7 injected failures against the real pipelines
+venv/Scripts/python -u run_finops.py                                          # measured cost per path, live cache experiment, projections
+venv/Scripts/python -u run_ticket_eval.py --backend adk,native,openai_agents,strands,agent_framework --pin-light
+```
+
+Built in this phase: per-route timeouts (the rate-limiter wait is outside the timed call), a per-route rate limiter, hold-or-label policy for the degraded tier on the knowledge path, held outcomes for failed required tools, retrieval and budget failures that end in a defined outcome instead of an exception, and the adoption of Requisite 0.42.0's request-scoped context (the tenant wrapper and the single-operator limit are gone). Ten decision records are in [`docs/decisions.md`](docs/decisions.md).
+
+### What the real runs showed
+
+- **Seven injected failures, seven defined outcomes, no restricted fact in any answer.** Light route down: escalated to the heavy model. All cloud routes down: the local model answered and the answer was held (or labelled, by policy). Embedding API down: failed closed with no model call. MCP server will not start: ticket held. Knowledge agent unreachable: ticket held because a requested fact was missing, no policy invented. Budget exhausted: held, nothing crashed.
+- **A shorter timeout can make the common case slower.** With an 8 s injected delay, no timeout answered in 9.7 s; with a 2 s timeout the request moved to the heavy model and answered in 17.0 s and 15.6 s in two runs, and fell through to the local model (held) in a third.
+- **Five coordinators, one result.** The same nine tickets on Google ADK, Requisite native, OpenAI Agents SDK, Strands and Microsoft Agent Framework: category 7/7 and severity 4/7 on every one, the same category on every ticket, all 28 model calls on every one through the gateway to the same Gemini model. The coordinators used 7,829 to 10,362 input tokens for the same work (a 32 percent spread, 14 percent in dollars). Latency is not comparable: the shared 15 requests per minute limiter works out to about 16 s per ticket, which four of the five measured.
+- **Measured unit costs** at published paid-tier prices: a ticket (4 model calls) $0.001104 on flash-lite and $0.004598 if every call ran on the heavy model; a knowledge answer $0.000167 and $0.000767.
+- **Cache experiment** on a deliberately repetitive 22-question workload: 22 model calls and $0.004065 with the cache off, 6 calls and $0.001116 with it on (threshold 0.90, scoped by access), mean latency 3.17 s to 1.12 s, zero wrong answers in both. The 73 percent hit rate belongs to that workload, and the cache's own embedding calls are not counted.
+- **Projections** (monthly cost at assumed volumes, and break-even against an assumed hosting cost) are arithmetic on those measurements, labelled as assumptions in the output.
+
+Everything ran on the Gemini free tier, so dollar figures are the same tokens priced at the published paid rates. Injected failures are switched on in front of real providers and are not vendor outages.
