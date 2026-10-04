@@ -18,14 +18,17 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from requisite import Agent
+from requisite import Agent, RequestContext
+from requisite.core.exceptions import CostLimitException
 from requisite.telemetry.otel import get_tracer
 
-from gateway.provider import GatewayProvider
-from gateway.tenant import TenantProvider
+from gateway.provider import GatewayExhausted, GatewayProvider
+from gateway.routing import degraded_routes_used
 from guardrails.policy import GuardrailPolicy
 from knowledge.corpus import User
 from knowledge.index import Hit, SecureIndex
@@ -52,6 +55,7 @@ class Answer:
     retrieved: list = field(default_factory=list)       # doc ids the model was shown
     reasons: list = field(default_factory=list)
     latency_s: float = 0.0
+    degraded: bool = False            # served (in part) by the degraded tier
 
 
 def access_fingerprint(user: User) -> str:
@@ -64,40 +68,56 @@ def build_prompt(question: str, hits: list[Hit]) -> str:
 
 
 class KnowledgeAssistant:
+    """`on_degraded` decides what a degraded-tier answer becomes: "hold" withholds it, "label" releases it with a visible banner."""
+
     def __init__(self, gateway: GatewayProvider, index: SecureIndex, policy: Optional[GuardrailPolicy] = None,
-                 enforce_acl: bool = True, scope_cache_by_acl: bool = True, top_k: int = 4) -> None:
+                 enforce_acl: bool = True, scope_cache_by_acl: bool = True, top_k: int = 4, on_degraded: str = "hold") -> None:
+        if on_degraded not in ("hold", "label"):
+            raise ValueError("on_degraded must be 'hold' or 'label'")
         self.gateway, self.index = gateway, index
         self.policy = policy or GuardrailPolicy(allowed_email_domains=frozenset({"example.com"}))
-        self.enforce_acl, self.scope_cache_by_acl, self.top_k = enforce_acl, scope_cache_by_acl, top_k
-        self._agents: dict[str, Agent] = {}
+        self.enforce_acl, self.scope_cache_by_acl, self.top_k, self.on_degraded = enforce_acl, scope_cache_by_acl, top_k, on_degraded
+        # One agent for everyone: who is asking travels in the request context, not in the agent.
+        self._agent = Agent(name="answerer", provider=gateway, system_prompt=SYSTEM_PROMPT, max_iterations=1)
 
-    def _agent_for(self, user: User) -> Agent:
-        scope = f"{user.org}:{access_fingerprint(user)}" if self.scope_cache_by_acl else user.org
-        if scope not in self._agents:
-            self._agents[scope] = Agent(name="answerer", provider=TenantProvider(self.gateway, scope),
-                                        system_prompt=SYSTEM_PROMPT, max_iterations=1)
-        return self._agents[scope]
-
-    def ask(self, user: User, question: str) -> Answer:
-        import time
+    def ask(self, user: User, question: str, correlation_id: str = "") -> Answer:
         t0 = time.perf_counter()
+        corr = correlation_id or uuid.uuid4().hex[:12]
+        # The context's tenant slot is the gateway's cache and budget scope: the organization plus the
+        # user's access fingerprint, so a cached answer is never served across access levels.
+        scope = f"{user.org}:{access_fingerprint(user)}" if self.scope_cache_by_acl else user.org
+        ctx = RequestContext(user=user.name, tenant=scope, correlation_id=corr)
+
+        def done(span, action, **kw) -> Answer:
+            span.set_attribute("knowledge.action", action)
+            return Answer(action, latency_s=time.perf_counter() - t0, **kw)
+
         with _tracer.start_as_current_span("knowledge.ask") as span:
             span.set_attribute("knowledge.user", user.name)
             span.set_attribute("knowledge.groups", ",".join(user.groups))
             decision = self.policy.check_input(question)
             if decision.action == "block":
-                span.set_attribute("knowledge.action", "escalated")
-                return Answer("escalated", reasons=decision.reasons, latency_s=time.perf_counter() - t0)
+                return done(span, "escalated", reasons=decision.reasons)
 
-            hits = self.index.search(user, decision.text, top_k=self.top_k, enforce_acl=self.enforce_acl)
+            try:
+                hits = self.index.search(user, decision.text, top_k=self.top_k, enforce_acl=self.enforce_acl)
+            except Exception as exc:  # noqa: BLE001 - e.g. the embedding API is down: fail closed, never answer ungrounded
+                return done(span, "held", reasons=[f"retrieval_unavailable: {type(exc).__name__}"])
             retrieved = sorted({h.doc_id for h in hits})
             span.set_attribute("knowledge.retrieved", ",".join(retrieved))
             prompt = build_prompt(decision.text, hits)
-            text = self._agent_for(user).run(prompt).content.strip()
+            try:
+                text = self._agent.run(prompt, context=ctx).content.strip()
+            except CostLimitException:
+                return done(span, "held", retrieved=retrieved, reasons=["budget_exhausted"])
+            except GatewayExhausted:
+                return done(span, "held", retrieved=retrieved, reasons=["model_unavailable"])
+            except Exception as exc:  # noqa: BLE001
+                return done(span, "held", retrieved=retrieved, reasons=[f"pipeline_error: {type(exc).__name__}"])
 
+            degraded = degraded_routes_used([r for r in self.gateway.audit.records if r.correlation_id == corr], self.gateway.routes)
             if text == NOT_FOUND:
-                span.set_attribute("knowledge.action", "not_found")
-                return Answer("not_found", text, [], retrieved, latency_s=time.perf_counter() - t0)
+                return done(span, "not_found", text=text, retrieved=retrieved, degraded=bool(degraded))
 
             citations = sorted(set(_CITATION.findall(text)))
             problems = []
@@ -106,8 +126,10 @@ class KnowledgeAssistant:
             stray = [c for c in citations if c not in retrieved]
             if stray:
                 problems.append(f"cites_unretrieved:{stray}")
-            out = self.policy.check_output(text, prompt)
-            problems += out.problems
-            action = "held" if problems else "answered"
-            span.set_attribute("knowledge.action", action)
-            return Answer(action, text, citations, retrieved, problems, time.perf_counter() - t0)
+            problems += self.policy.check_output(text, prompt).problems
+            if degraded and self.on_degraded == "hold":
+                problems.append(f"served_by_degraded_tier: {','.join(degraded)}")
+            elif degraded:
+                text = f"[Answered by a fallback model; verify before relying on it] {text}"
+            return done(span, "held" if problems else "answered", text=text, citations=citations, retrieved=retrieved,
+                        reasons=problems, degraded=bool(degraded))

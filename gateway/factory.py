@@ -19,7 +19,6 @@ from gateway.audit import AuditLog
 from gateway.cache import SemanticCache
 from gateway.faults import FaultInjector
 from gateway.provider import GatewayProvider
-from gateway.ratelimit import RateLimitedProvider
 from gateway.resilience import CircuitBreaker
 from gateway.routing import DEGRADED, HEAVY, LIGHT, Route
 
@@ -65,9 +64,11 @@ def build_gateway(
     use_cache: bool = True,
     classifier=None,
     limiter: Optional[RateLimiter] = None,
+    timeouts: Optional[dict] = None,
     audit_path: Optional[str] = None,
     breaker_reset_s: float = 30.0,
 ):
+    timeouts = timeouts or {}
     key = os.environ["GEMINI_API_KEY"]
     light_model = os.environ.get("LIGHT_MODEL", "gemini-3.5-flash-lite")
     heavy_model = os.environ.get("HEAVY_MODEL", "gemini-3.5-flash")
@@ -77,8 +78,8 @@ def build_gateway(
     # Pass one `limiter` to several gateways that share an API key: two
     # limiter instances do not know about each other and together can exceed the quota.
     limiter = limiter or RateLimiter(requests_per_minute=rpm)
-    light = RateLimitedProvider(GeminiProvider(api_key=key, model=light_model), limiter)
-    heavy = RateLimitedProvider(GeminiProvider(api_key=key, model=heavy_model), limiter)
+    light = GeminiProvider(api_key=key, model=light_model)
+    heavy = GeminiProvider(api_key=key, model=heavy_model)
     local = OllamaProvider(model="llama3.2:1b", timeout=180.0)
     faults: dict[str, FaultInjector] = {}
     if with_faults:
@@ -87,9 +88,12 @@ def build_gateway(
 
     free = cost_per_token(prompt_rate_per_1k=0.0, completion_rate_per_1k=0.0)
     routes = [
-        Route("gemini-light", light, LIGHT, gemini_cost_fn(light_model), CircuitBreaker(reset_timeout_s=breaker_reset_s)),
-        Route("gemini-heavy", heavy, HEAVY, gemini_cost_fn(heavy_model), CircuitBreaker(reset_timeout_s=breaker_reset_s)),
-        Route("local-llama", local, DEGRADED, free, CircuitBreaker(reset_timeout_s=breaker_reset_s)),
+        Route("gemini-light", light, LIGHT, gemini_cost_fn(light_model), CircuitBreaker(reset_timeout_s=breaker_reset_s),
+              timeout_s=timeouts.get("light", 30.0), limiter=limiter),
+        Route("gemini-heavy", heavy, HEAVY, gemini_cost_fn(heavy_model), CircuitBreaker(reset_timeout_s=breaker_reset_s),
+              timeout_s=timeouts.get("heavy", 45.0), limiter=limiter),
+        Route("local-llama", local, DEGRADED, free, CircuitBreaker(reset_timeout_s=breaker_reset_s),
+              timeout_s=timeouts.get("local", 120.0)),
     ]
     embedder = GeminiEmbeddingProvider(api_key=key, model=os.environ.get("EMBEDDING_MODEL", "gemini-embedding-2"))
     cache = SemanticCache(embedder.embed_one, threshold=cache_threshold)

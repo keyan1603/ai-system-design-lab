@@ -129,7 +129,7 @@ class KnowledgeA2AAgent(BaseAgent):
         else:
             user = User(claims.sub, "acme", tuple(claims.groups))
             # to_thread keeps the blocking Requisite call off the event loop and copies the trace context.
-            ans = await asyncio.to_thread(self._assistant.ask, user, question)
+            ans = await asyncio.to_thread(self._assistant.ask, user, question, corr)
             text = ans.text if ans.action in ("answered", "not_found") else WITHHELD
             outcome, groups, retrieved, cited = ans.action, list(claims.groups), ans.retrieved, ans.citations
             sub, act = claims.sub, claims.act or ""

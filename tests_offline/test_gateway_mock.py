@@ -311,18 +311,18 @@ def test_cache_hit_records_savings_not_spend():
     assert gw.audit.summary()["tokens_saved_by_cache"] == 150
 
 
-def test_rate_limited_provider_acquires_before_each_call():
-    from gateway.ratelimit import RateLimitedProvider
-
+def test_route_limiter_is_acquired_before_each_attempt_and_not_counted_as_slowness():
     class Counting:
         n = 0
-        def acquire(self): Counting.n += 1
-        async def aacquire(self): Counting.n += 1
+        def acquire(self):
+            import time as _t
+            Counting.n += 1
+            _t.sleep(0.3)                                   # queueing for quota, longer than the timeout below
+    r = Route("l", FakeProvider("l"), LIGHT, COST, CircuitBreaker(), timeout_s=0.2, limiter=Counting())
+    gw = GatewayProvider([r])
+    assert gw.chat(user("x")).provider == "l"               # waiting on the limiter did NOT trip the timeout
+    assert Counting.n == 1
 
-    inner = FakeProvider("l")
-    p = RateLimitedProvider(inner, Counting())
-    p.chat(user("x")); p.chat(user("y"))
-    assert Counting.n == 2 and inner.calls == 2
 
 
 # ---- per-tenant budgets, tenant pinning ----------------------------------------------
@@ -344,14 +344,25 @@ def test_global_budget_still_applies_above_tenant_budgets():
         gw.chat(user("b"), tenant="globex")           # fleet ceiling reached by someone else's spend
 
 
-def test_tenant_provider_pins_tenant_for_audit_and_cache_scope():
-    from gateway.tenant import TenantProvider
+def test_request_context_supplies_tenant_and_correlation_id():
+    from requisite import RequestContext, request_context
     light = route("l", LIGHT)
     gw = GatewayProvider([light], cache=SemanticCache(toy_embed))
-    a, b = TenantProvider(gw, "acme"), TenantProvider(gw, "globex")
-    a.chat(user("same text")); b.chat(user("same text"))
-    assert light.provider.calls == 2
-    assert [r.tenant for r in gw.audit.records] == ["acme", "globex"]
+    with request_context(RequestContext(user="u1", tenant="acme", correlation_id="c-1")):
+        gw.chat(user("same text"))
+    with request_context(RequestContext(user="u2", tenant="globex", correlation_id="c-2")):
+        gw.chat(user("same text"))
+    assert light.provider.calls == 2                      # tenants never share a cache entry
+    assert [(r.tenant, r.correlation_id) for r in gw.audit.records] == [("acme", "c-1"), ("globex", "c-2")]
+
+
+def test_explicit_tenant_argument_still_overrides_the_context():
+    from requisite import RequestContext, request_context
+    gw = GatewayProvider([route("l", LIGHT)])
+    with request_context(RequestContext(user="u", tenant="from-context")):
+        gw.chat(user("x"), tenant="explicit")
+    assert gw.audit.records[-1].tenant == "explicit"
+
 
 
 def test_async_path_emits_gateway_span_too():
@@ -403,3 +414,58 @@ def test_degraded_routes_used_reports_only_degraded_tier():
     ok = GatewayProvider([route("l", LIGHT), route("d", DEGRADED)])
     ok.chat(user("a"))
     assert degraded_routes_used(ok.audit.records, ok.routes) == []
+
+
+# ---- per-route timeouts --------------------------------------------------------------
+class SlowProvider(FakeProvider):
+    def __init__(self, name, delay):
+        super().__init__(name)
+        self.delay = delay
+
+    def chat(self, messages, **kw):
+        import time as _t
+        _t.sleep(self.delay)
+        return super().chat(messages, **kw)
+
+    async def achat(self, messages, **kw):
+        await asyncio.sleep(self.delay)
+        return FakeProvider.chat(self, messages, **kw)
+
+
+def test_slow_route_times_out_and_fails_over_in_bounded_time():
+    import time as _t
+    slow = Route("slow", SlowProvider("slow", 3.0), LIGHT, COST, CircuitBreaker(), timeout_s=0.2)
+    gw = GatewayProvider([slow, route("h", HEAVY)])
+    t0 = _t.perf_counter()
+    resp = gw.chat(user("hi"))
+    assert resp.provider == "h" and _t.perf_counter() - t0 < 1.5
+    rec = gw.audit.records[-1]
+    assert rec.attempts[0]["route"] == "slow" and "TimeoutError" in rec.attempts[0]["error"]
+
+
+def test_repeated_timeouts_open_the_breaker():
+    slow = Route("slow", SlowProvider("slow", 3.0), LIGHT, COST, CircuitBreaker(failure_threshold=2), timeout_s=0.1)
+    gw = GatewayProvider([slow, route("h", HEAVY)])
+    gw.chat(user("a")); gw.chat(user("b"))
+    assert slow.breaker.state == OPEN
+
+
+def test_async_timeout_fails_over():
+    slow = Route("slow", SlowProvider("slow", 3.0), LIGHT, COST, CircuitBreaker(), timeout_s=0.1)
+    gw = GatewayProvider([slow, route("h", HEAVY)])
+    assert asyncio.run(gw.achat(user("hi"))).provider == "h"
+
+
+def test_timeout_carries_the_request_context_into_the_worker_thread():
+    from requisite import RequestContext, current_context, request_context
+    seen = {}
+
+    class Probe(FakeProvider):
+        def chat(self, messages, **kw):
+            seen["ctx"] = current_context()
+            return super().chat(messages, **kw)
+
+    gw = GatewayProvider([Route("p", Probe("p"), LIGHT, COST, CircuitBreaker(), timeout_s=5)])
+    with request_context(RequestContext(user="u", tenant="t", correlation_id="c-9")):
+        gw.chat(user("hi"))
+    assert seen["ctx"].correlation_id == "c-9"

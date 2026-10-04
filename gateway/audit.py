@@ -35,6 +35,7 @@ class AuditRecord:
     latency_ms: float = 0.0
     cache_similarity: Optional[float] = None
     prompt: Optional[str] = None  # only populated when log_content=True
+    correlation_id: str = ""      # from the request context, ties gateway calls to one ticket or question
 
 
 class AuditLog:

@@ -10,7 +10,7 @@ gateway's resilience logic, not the policy's.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from requisite.core.cost_limiter import CostFn
 from requisite.core.interfaces import Message
@@ -28,6 +28,13 @@ class Route:
     tier: str
     cost_fn: CostFn
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
+    # Seconds to wait for this route before treating the call as failed and failing over.
+    # None means wait as long as the provider does, which lets one slow upstream stall every request.
+    timeout_s: Optional[float] = None
+    # Requisite RateLimiter for the upstream quota this route draws on. It is acquired BEFORE the
+    # timed call, so time spent queueing for quota is never counted as the provider being slow.
+    # Routes that share an API key share one limiter instance; a local route has none.
+    limiter: Optional[Any] = None
 
 
 Classifier = Callable[[Sequence[Message], bool, bool], str]

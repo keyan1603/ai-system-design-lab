@@ -19,9 +19,12 @@ import hashlib
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Optional
 
 from pydantic import BaseModel
+from requisite import current_context, submit_with_context
 from requisite.core.cost_limiter import CostLimiter
 from requisite.core.exceptions import CostLimitException, ProviderException
 from requisite.core.interfaces import ChatResponse, Message, Role, StreamChunk
@@ -40,6 +43,7 @@ from gateway.cache import SemanticCache, make_scope, prompt_text
 from gateway.routing import Classifier, Route, default_classifier, fallback_order
 
 _tracer = get_tracer("ai_system_design.gateway")
+_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="gateway-call")
 
 # kwargs consumed by the gateway itself, never forwarded to a provider
 _GATEWAY_KWARGS = ("tenant", "tier", "no_cache")
@@ -109,6 +113,29 @@ class GatewayProvider(BaseProvider):
             if limiter is not None:
                 limiter.record(response.usage, response.model)
 
+    def _call_sync(self, route, messages, temperature, tools, response_model, kwargs):
+        if route.limiter is not None:
+            route.limiter.acquire()
+        if route.timeout_s is None:
+            return route.provider.chat(messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs)
+        # The provider call runs in a worker thread (carrying the request context) so the
+        # gateway can stop waiting. The abandoned call still finishes in the background;
+        # a timeout bounds latency, it does not cancel work or its cost.
+        future = submit_with_context(_TIMEOUT_POOL, route.provider.chat, messages, temperature=temperature, tools=tools,
+                                     response_model=response_model, **kwargs)
+        try:
+            return future.result(timeout=route.timeout_s)
+        except FutureTimeout as exc:
+            raise TimeoutError(f"route {route.name} exceeded {route.timeout_s}s") from exc
+
+    async def _call_async(self, route, messages, temperature, tools, response_model, kwargs):
+        if route.limiter is not None:
+            await route.limiter.aacquire()
+        call = route.provider.achat(messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs)
+        if route.timeout_s is None:
+            return await call
+        return await asyncio.wait_for(call, timeout=route.timeout_s)
+
     def preflight(self, probe: bool = False) -> dict:
         """Check every route *before* an outage forces the gateway to use it.
 
@@ -130,7 +157,10 @@ class GatewayProvider(BaseProvider):
     # -- shared planning / bookkeeping ---------------------------------------
     def _plan(self, messages, tools, response_model, kwargs):
         opts = {k: kwargs.pop(k) for k in _GATEWAY_KWARGS if k in kwargs}
-        tenant = opts.get("tenant", self.default_tenant)
+        # Tenant and correlation id come from Requisite's request-scoped context
+        # (0.42.0+) unless a caller passes `tenant=` explicitly; no wrapper has to carry them.
+        ctx = current_context()
+        tenant = opts.get("tenant") or (ctx.tenant if ctx and ctx.tenant else self.default_tenant)
         tier = opts.get("tier") or self.classifier(messages, bool(tools), response_model is not None)
         # Tool-calling responses are never cached: they describe an action to
         # take, and replaying a stale action is worse than paying for a call.
@@ -159,6 +189,7 @@ class GatewayProvider(BaseProvider):
             "has_tools": bool(tools),
             "loop_key": loop_key,
             "request_id": uuid.uuid4().hex[:12],
+            "correlation_id": (ctx.correlation_id if ctx and ctx.correlation_id else ""),
             "tenant": tenant,
             "tier": tier,
             "cacheable": cacheable,
@@ -170,6 +201,7 @@ class GatewayProvider(BaseProvider):
     def _record(self, plan, t0, outcome, route=None, response=None, attempts=None, cost=0.0, sim=None):
         rec = AuditRecord(
             request_id=plan["request_id"],
+            correlation_id=plan["correlation_id"],
             tenant=plan["tenant"],
             tier=plan["tier"],
             outcome=outcome,
@@ -273,9 +305,7 @@ class GatewayProvider(BaseProvider):
                     attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
                     continue
                 try:
-                    response = route.provider.chat(
-                        messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs
-                    )
+                    response = self._call_sync(route, messages, temperature, tools, response_model, kwargs)
                 except Exception as exc:  # any provider/transport failure triggers failover
                     route.breaker.record_failure()
                     attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})
@@ -328,9 +358,7 @@ class GatewayProvider(BaseProvider):
                     attempts.append({"route": route.name, "ok": False, "error": "circuit_open"})
                     continue
                 try:
-                    response = await route.provider.achat(
-                        messages, temperature=temperature, tools=tools, response_model=response_model, **kwargs
-                    )
+                    response = await self._call_async(route, messages, temperature, tools, response_model, kwargs)
                 except Exception as exc:
                     route.breaker.record_failure()
                     attempts.append({"route": route.name, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]})

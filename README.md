@@ -15,7 +15,7 @@ An in-process AI gateway that **is** a Requisite provider (`GatewayProvider(Base
 | `resilience.py` | `CircuitBreaker` (closed / open / half-open, injectable clock) |
 | `cache.py` | `SemanticCache`: exact hash lookup, then embedding similarity; entries are scoped by tenant and system prompt |
 | `audit.py` | One `AuditRecord` per request; prompts are hashed, not stored, unless you opt in |
-| `ratelimit.py` | `RateLimitedProvider`: a Requisite `RateLimiter` placed next to the one real API it protects |
+| (rate limits) | a Requisite `RateLimiter` is attached to each `Route` and acquired before the timed call, so queueing for quota is never counted as the provider being slow; routes sharing an API key share one limiter |
 | `faults.py` | `FaultInjector`: switch an outage on or off in front of a real provider |
 | `factory.py` | Standard build: Gemini light + heavy (Requisite `GeminiProvider`), local Ollama (Requisite `OllamaProvider`), Requisite `GeminiEmbeddingProvider` for the cache, Requisite `CostLimiter` for the budget |
 

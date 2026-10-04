@@ -101,7 +101,7 @@ def score(outcomes):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default="both", choices=["adk", "native", "both"])
+    ap.add_argument("--backend", default="both", help="adk | native | both | openai_agents | strands | agent_framework, or a comma list")
     ap.add_argument("--only", default=None)
     ap.add_argument("--tag", default="", help="suffix for audit/outcome files")
     ap.add_argument("--show", action="store_true")
@@ -110,7 +110,7 @@ def main():
     global SHOW
     SHOW = args.show
     tickets = [t for t in TICKETS if not args.only or t.id == args.only]
-    backends = ["adk", "native"] if args.backend == "both" else [args.backend]
+    backends = ["adk", "native"] if args.backend == "both" else args.backend.split(",")
     results = {}
     from requisite.core.rate_limiter import RateLimiter
     shared_limiter = RateLimiter(requests_per_minute=15)   # one limiter for one API key, shared across backends

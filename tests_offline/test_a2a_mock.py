@@ -112,3 +112,32 @@ def test_one_trace_spans_client_and_server(service):
     root = next(s for s in spans if s.name == "caller.root")
     server_side = [s for s in spans if s.name == "knowledge.ask"]
     assert server_side and server_side[-1].context.trace_id == root.context.trace_id
+
+
+# ---- policy tool: failures are recorded per request, and credentials stay out of the context ----
+def test_policy_tool_records_failures_per_correlation_id_and_isolates_concurrent_operators():
+    from requisite import RequestContext, request_context
+    from tickets.policy_tool import DENIED_TEXT, PolicyTool
+
+    class FakeClient:
+        async def ask(self, question, token, correlation_id, subject="x"):
+            if correlation_id == "bad":
+                raise RemoteDenied("connection refused")
+            return f"answer for {correlation_id}"
+
+    ptool = PolicyTool(FakeClient(), IDP)
+    ptool.sessions.put("good", IDP.login("sam", "ticket-agent"))
+    ptool.sessions.put("bad", IDP.login("alice", "ticket-agent"))
+    tool = ptool.as_tool().tool
+
+    async def run(corr, op):
+        with request_context(RequestContext(user=op, tenant="acme", correlation_id=corr)):
+            return await tool.aexecute(question="refund policy?")
+
+    async def both():
+        return await asyncio.gather(run("good", "sam"), run("bad", "alice"))
+
+    good, bad = asyncio.run(both())
+    assert good == "answer for good" and bad == DENIED_TEXT
+    assert ptool.failures("bad") and not ptool.failures("good")
+    assert {c["operator"] for c in ptool.calls} == {"sam", "alice"}      # each call saw its own operator
