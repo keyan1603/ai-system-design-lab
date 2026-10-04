@@ -72,17 +72,35 @@ class TicketPlatform:
         self.gateway, self.backend = gateway, backend
         # example.com is the synthetic company domain used by the knowledge base.
         self.policy = policy or GuardrailPolicy(allowed_email_domains=frozenset({"example.com"}))
-        # MCP server as a subprocess over stdio; tools are discovered once and reused.
-        self._mcp = MCPClient.stdio(name="ticket-ops", command=sys.executable, args=["-m", "tickets.mcp_server"])
-        self._tools = self._mcp.discover_tools()
         self._workflows: dict[str, Workflow] = {}
+        self._resolvers: list[Agent] = []
+
+    def close(self) -> None:
+        """Close every resolver agent, which closes the MCP sessions it owns."""
+        for agent in self._resolvers:
+            agent.close()
+        self._resolvers.clear()
+        self._workflows.clear()
+
+    def __enter__(self) -> "TicketPlatform":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _workflow_for(self, tenant: str) -> Workflow:
         if tenant not in self._workflows:
             provider = TenantProvider(self.gateway, tenant)
             wf = Workflow()
             wf.add(Agent(name="triage", provider=provider, system_prompt=TRIAGE_PROMPT, max_iterations=1))
-            wf.add(Agent(name="resolver", provider=provider, system_prompt=RESOLVER_PROMPT, tools=self._tools, max_iterations=6))
+            # The resolver owns its MCP session (Requisite 0.40.0): it connects on
+            # first tool use and reuses that one server process for every call,
+            # instead of spawning and initializing a server per tool call. One
+            # client per tenant workflow, because a client holds one session.
+            mcp = MCPClient.stdio(name="ticket-ops", command=sys.executable, args=["-m", "tickets.mcp_server"])
+            resolver = Agent(name="resolver", provider=provider, system_prompt=RESOLVER_PROMPT, mcp_clients=[mcp], max_iterations=6)
+            self._resolvers.append(resolver)
+            wf.add(resolver)
             wf.add(Agent(name="responder", provider=provider, system_prompt=RESPONDER_PROMPT, max_iterations=1))
             wf.use_adk() if self.backend == "adk" else wf.use_native()
             self._workflows[tenant] = wf

@@ -57,10 +57,10 @@ def trace_tree(trace_id):
     return "\n".join(lines)
 
 
-def run_backend(backend, tickets, pin_light=False):
+def run_backend(backend, tickets, pin_light=False, limiter=None, tag=""):
     from gateway.routing import LIGHT
-    gw, _ = build_gateway(use_cache=False, tenant_budget_usd=0.05, audit_path=f"audit/phase2_{backend}{'_pinned' if pin_light else ''}.jsonl",
-                          classifier=(lambda m, t, s: LIGHT) if pin_light else None)
+    gw, _ = build_gateway(use_cache=False, tenant_budget_usd=0.05, audit_path=f"audit/phase2_{backend}{'_pinned' if pin_light else ''}{tag}.jsonl",
+                          classifier=(lambda m, t, s: LIGHT) if pin_light else None, limiter=limiter)
     platform = TicketPlatform(gw, backend=backend)
     rows, outcomes = [], []
     for t in tickets:
@@ -75,7 +75,8 @@ def run_backend(backend, tickets, pin_light=False):
         if SHOW:
             print("     reply:", o.reply[:400].replace(chr(10), " "))
     import json as _json
-    with open(f"audit/phase2_outcomes_{backend}{'_pinned' if pin_light else ''}.json", "w", encoding="utf-8") as f:
+    platform.close()
+    with open(f"audit/phase2_outcomes_{backend}{'_pinned' if pin_light else ''}{tag}.json", "w", encoding="utf-8") as f:
         _json.dump([{"id": t.id, "action": o.action, "reasons": o.reasons, "reply": o.reply, "tools": o.tools_used,
                      "latency_s": o.latency_s, "calls": o.model_calls,
                      "triage": o.triage.model_dump() if o.triage else None} for t, o in outcomes], f, indent=1)
@@ -102,6 +103,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default="both", choices=["adk", "native", "both"])
     ap.add_argument("--only", default=None)
+    ap.add_argument("--tag", default="", help="suffix for audit/outcome files")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--pin-light", action="store_true", help="route every request to the light tier so backends are compared on the same model")
     args = ap.parse_args()
@@ -110,8 +112,10 @@ def main():
     tickets = [t for t in TICKETS if not args.only or t.id == args.only]
     backends = ["adk", "native"] if args.backend == "both" else [args.backend]
     results = {}
+    from requisite.core.rate_limiter import RateLimiter
+    shared_limiter = RateLimiter(requests_per_minute=15)   # one limiter for one API key, shared across backends
     for b in backends:
-        gw, outcomes = run_backend(b, tickets, args.pin_light)
+        gw, outcomes = run_backend(b, tickets, args.pin_light, shared_limiter, args.tag)
         results[b] = (gw, outcomes)
         print("\n", b, "score:", score(outcomes))
         print(b, "gateway summary:", gw.audit.summary())

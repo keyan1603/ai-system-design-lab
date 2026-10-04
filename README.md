@@ -82,3 +82,38 @@ venv/Scripts/python -u run_ticket_eval.py --pin-light --show          # both bac
 - **ADK's per-agent token counters read empty** (`in=None out=None`) because Requisite's ADK shim does not pass usage back to ADK.
 
 Cost figures are computed from published paid-tier prices; the runs themselves used the free tier.
+
+
+---
+
+## Phase 3: the enterprise knowledge assistant (`knowledge/`)
+
+```
+question -> input guard -> ACL-filtered retrieval -> answer agent -> citation check -> output guard -> answered | not_found | held | escalated
+```
+
+| Piece | Built with |
+|---|---|
+| Embeddings, vector store, chunking | Requisite `GeminiEmbeddingProvider` (`gemini-embedding-2`), `InMemoryVectorStore`, `Retriever.add_texts` |
+| Access control | `knowledge/index.py`: one boolean flag per allowed group on every chunk, one **pre-filtered** store search per group the user belongs to, merged. No groups means no results |
+| Answer agent | Requisite `Agent` on the shared gateway, provider pinned to the user's *access fingerprint* so the cache never crosses access levels |
+| Checks | Every answer must cite sources, every citation must be a chunk retrieved for that user, plus the Phase 2 input and output guards |
+
+Authorization is enforced in code at retrieval, never by asking the model to behave. A leak is measured, not judged: each restricted document carries a canary fact that appears nowhere else.
+
+```bash
+venv/Scripts/python -m pytest tests_offline -q          # 68 offline tests
+venv/Scripts/python -u run_knowledge_eval.py            # real run: ACL on, ACL off (control), cache-scope experiment
+```
+
+### What the real run showed (12 synthetic documents, 5 users, 13 questions, `gemini-3.5-flash-lite`)
+
+- **Access control ON: 13/13 correct, 0/5 restricted documents leaked.** All six authorized questions were answered with the right citation and exact facts; the five questions a user was not allowed to see returned "I can't find that in the documents you have access to"; the unanswerable question did too; the injection attempt was escalated with no model call.
+- **Access control OFF (control): 8/13 correct, 5/5 restricted documents leaked.** Same model, same questions, retrieval ignoring groups: the model answered every one of them, with a valid citation. The **citation check passed all five leaks**, because it verifies that an answer is grounded in what was retrieved, not that retrieval was authorized. Grounding checks and authorization are different controls.
+- **The model never receives unauthorized text** (asserted offline by capturing the exact prompt for every question).
+- **Cache scope:** with an access-fingerprint scope and with an organization-only scope, the second user was not served the first user's answer at similarity threshold 0.90, because the cache keys on the whole prompt, sources included, and the two users' sources differed. That is an accident of protection, not a guarantee. Offline, a permissive threshold (0.5) under an organization-only scope *does* serve one user's answer to another; there the citation check held the answer because it cited a document the second user was never shown. Keep the access fingerprint in the scope.
+- **Limits of this run:** 12 documents of one chunk each, so it exercises authorization and citation mechanics, not retrieval quality at scale.
+
+### Requisite 0.40.0 adopted (agent-owned persistent MCP sessions, ADK token usage)
+
+On the same 9 tickets and model as Phase 2, the resolver's three MCP tool calls dropped from **about 6.4 s each (initialize dominated) to 3 to 4 ms each**, with one 974 ms `initialize` per agent, and ADK's per-agent token counts are now populated (`in=1174 out=182` instead of `None`). End-to-end ticket latency still shows 37 to 46 s outliers: each is a single model call that includes waiting on the shared 15-requests-per-minute rate limiter, which this run did not instrument separately, so no orchestrator or MCP conclusion is drawn from them.
