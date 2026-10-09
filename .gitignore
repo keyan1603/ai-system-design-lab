@@ -12,3 +12,4 @@ install.log
 audit/**/*.jsonl
 audit/**/*.json
 baselines/
+*.egg-info/
