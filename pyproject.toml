@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-system-design-lab"
+version = "0.1.0"
+description = "Reference system for enterprise AI design: gateway, ticket platform, knowledge assistant, A2A with identity, drift monitoring"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["gateway*", "guardrails*", "tickets*", "knowledge*", "identity*", "a2a_layer*", "monitoring*"]
