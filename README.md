@@ -2,7 +2,7 @@
 
 A runnable reference system for designing enterprise AI: one AI gateway, two real scenarios (a support-ticket platform and an enterprise knowledge assistant), agent-to-agent calls with verified identity, drift monitoring, a failure-mode study and a cost study. Every claim in the companion blog post, *How to Design an AI System That Doesn't Leak, Lie or Fall Over*, comes from code and measurements in this repo.
 
-It is built on [Requisite](https://github.com/keyan1603/requisite-ai) (providers, agents, multi-agent workflows, RAG, MCP, rate and cost limits, tracing), Google's Agent Development Kit (ADK, including its A2A support), and the provider SDKs. Requisite supplies the building blocks; this repo adds the policy layer on top: gateway, guardrails, access control, identity and monitoring.
+It is built on [Requisite](https://github.com/requisite-ai/requisite-ai) (providers, agents, multi-agent workflows, RAG, MCP, rate and cost limits, tracing), Google's Agent Development Kit (ADK, including its A2A support), and the provider SDKs. Requisite supplies the building blocks; this repo adds the policy layer on top: gateway, guardrails, access control, identity and monitoring.
 
 ## Architecture
 
